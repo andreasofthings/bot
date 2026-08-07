@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # Copy the uv binary from the official image
-COPY --from=ghcr.io/astral-sh/uv:0.2.20 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.2.20 /uv /bin/
 
 # Set env settings to use the virtualenv automatically
 ENV PYTHONDONTWRITEBYTECODE=1
