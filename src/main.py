@@ -5,7 +5,6 @@ from src.config import load_settings, load_cli_args
 from src.utils.logger import configure_logging, get_logger
 from src.core.plugin import PluginManager
 from src.core.bot import MatrixBot
-from src.plugins.help import HelpPlugin
 
 # We initialize a raw python logger temporarily until structlog is configured
 import logging
@@ -39,20 +38,21 @@ async def main() -> None:
     plugin_manager = PluginManager()
 
     # Help plugin needs to know about other registered plugins
-    help_plugin = HelpPlugin(plugin_manager)
-    plugin_manager.register_plugin(help_plugin)
 
+    from src.plugins.help import HelpPlugin
     from src.plugins.onboarding import OnboardingPlugin
-    onboarding_plugin = OnboardingPlugin()
-    plugin_manager.register_plugin(onboarding_plugin)
-
-    from src.plugins.rss import RSSPlugin
-    rss_plugin = RSSPlugin()
-    plugin_manager.register_plugin(rss_plugin)
-
     from src.plugins.stock import StockPlugin
+    from src.plugins.rss import RSSPlugin
+
+    help_plugin = HelpPlugin(plugin_manager)
+    onboarding_plugin = OnboardingPlugin()
     stock_plugin = StockPlugin()
+    rss_plugin = RSSPlugin()
+
+    plugin_manager.register_plugin(help_plugin)
+    plugin_manager.register_plugin(onboarding_plugin)
     plugin_manager.register_plugin(stock_plugin)
+    plugin_manager.register_plugin(rss_plugin)
 
     # 3. Instantiate bot runner
     bot = MatrixBot(settings, plugin_manager)

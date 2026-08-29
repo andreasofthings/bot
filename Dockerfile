@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # Copy the uv binary from the official image
-COPY --from=ghcr.io/astral-sh/uv:0.2.20 /uv /bin/
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set env settings to use the virtualenv automatically
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -26,11 +26,11 @@ RUN groupadd -g 10001 botgroup && \
 
 USER botuser
 
-# Copy pyproject.toml to install dependencies
-COPY --chown=botuser:botgroup pyproject.toml ./
+# Copy pyproject.toml and uv.lock to install dependencies
+COPY --chown=botuser:botgroup pyproject.toml uv.lock ./
 
 # Synchronize dependencies (creates /app/.venv) without installing the local project
-RUN uv sync --no-install --no-dev --no-cache
+RUN uv sync --no-install-project --no-dev --no-cache
 
 # Copy source code
 COPY --chown=botuser:botgroup src/ ./src
