@@ -13,6 +13,7 @@ from src.core.database import get_db_session
 from src.models.rss import RSSFeed, RSSSubscription, RSSHistory
 from src.models.user import User
 from src.config import load_settings
+from src.fixtures.rss_feeds import get_default_rss_fixtures, find_fixture_by_slug_or_name
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -64,12 +65,22 @@ class RSSPlugin(Plugin):
             await self._handle_list(client, room, event)
             return
 
-        # 2. Command: !rss subscribe <url> [filters]
+        # 2. Command: !rss feeds (Lists curated default German news feeds)
+        elif sub_cmd in ["feeds", "catalog", "available"]:
+            await self._handle_feeds(client, room, event)
+            return
+
+        # 3. Command: !rss defaults / seed (Subscribes room to curated defaults)
+        elif sub_cmd in ["defaults", "default", "seed"]:
+            await self._handle_defaults(client, room, event)
+            return
+
+        # 4. Command: !rss subscribe <url_or_slug> [filters]
         elif sub_cmd == "subscribe":
             await self._handle_subscribe(client, room, event, args[1:])
             return
 
-        # 3. Command: !rss unsubscribe <id_or_url>
+        # 5. Command: !rss unsubscribe <id_or_slug_or_url>
         elif sub_cmd == "unsubscribe":
             await self._handle_unsubscribe(client, room, event, args[1:])
             return
@@ -122,6 +133,76 @@ class RSSPlugin(Plugin):
 
             await send_rich_message(client, room.room_id, "\n".join(plain_lines), "".join(html_lines))
 
+    async def _handle_feeds(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
+        """Lists available curated German news RSS feed fixtures."""
+        fixtures = get_default_rss_fixtures()
+        html_lines = ["<b>📰 Curated Major German News Feeds (Fixtures):</b><ul>"]
+        plain_lines = ["Curated Major German News Feeds (Fixtures):"]
+        for f in fixtures:
+            slug = f.get("slug", "")
+            name = f.get("name", "")
+            cat = f.get("category", "")
+            url = f.get("url", "")
+            html_lines.append(
+                f"<li><b>{name}</b> [<code>{slug}</code>] &mdash; <i>{cat}</i><br>"
+                f"Subscribe: <code>!rss subscribe {slug}</code> | <a href='{url}'>Feed URL</a></li>"
+            )
+            plain_lines.append(f"  • {name} [{slug}] ({cat}): !rss subscribe {slug}")
+        html_lines.append(
+            "</ul><p>💡 Tip: Use <code>!rss subscribe &lt;slug&gt;</code> to subscribe with optional filters, "
+            "or <code>!rss defaults</code> to subscribe this room to all top German news feeds.</p>"
+        )
+        plain_lines.append("\nTip: Use '!rss subscribe <slug>' or '!rss defaults' to subscribe.")
+        await send_rich_message(client, room.room_id, "\n".join(plain_lines), "".join(html_lines))
+
+    async def _handle_defaults(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
+        """Subscribes current room context to top default German news feeds."""
+        subscriber_id = room.canonical_alias if room.canonical_alias else room.room_id
+        if len(room.users) <= 2:
+            subscriber_id = event.sender
+
+        fixtures = get_default_rss_fixtures()
+        # Top major German news outlets
+        top_slugs = ["tagesschau", "zdf", "spiegel", "zeit", "faz", "sz", "handelsblatt", "heise"]
+        selected_fixtures = [f for f in fixtures if f.get("slug") in top_slugs]
+
+        async with get_db_session() as session:
+            subscribed_names = []
+            for f in selected_fixtures:
+                q_feed = select(RSSFeed).where(RSSFeed.url == f["url"])
+                res_f = await session.execute(q_feed)
+                feed = res_f.scalar_one_or_none()
+                if not feed:
+                    feed = RSSFeed(url=f["url"], name=f["name"])
+                    session.add(feed)
+                    await session.flush()
+
+                q_sub = select(RSSSubscription).where(
+                    RSSSubscription.subscriber_id == subscriber_id,
+                    RSSSubscription.feed_id == feed.id
+                )
+                res_s = await session.execute(q_sub)
+                if not res_s.scalar_one_or_none():
+                    sub = RSSSubscription(
+                        subscriber_id=subscriber_id,
+                        subscriber_type="room" if room.canonical_alias or len(room.users) > 2 else "user",
+                        feed_id=feed.id
+                    )
+                    session.add(sub)
+                    subscribed_names.append(feed.name or f["name"])
+
+            if subscribed_names:
+                msg = f"Subscribed {subscriber_id} to {len(subscribed_names)} default German news feeds:\n- " + "\n- ".join(subscribed_names)
+                html = (
+                    f"✅ <b>Subscribed to Default German News Feeds:</b><ul>"
+                    + "".join(f"<li>{n}</li>" for n in subscribed_names)
+                    + "</ul>"
+                )
+            else:
+                msg = "Already subscribed to all top default German news feeds."
+                html = "Already subscribed to all top default German news feeds."
+            await send_rich_message(client, room.room_id, msg, html)
+
     async def _handle_subscribe(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText, sub_args: List[str]) -> None:
         """Subscribes the current room context to an RSS feed URL, parsing filter arguments."""
         settings = load_settings()
@@ -129,7 +210,14 @@ class RSSPlugin(Plugin):
             await send_rich_message(client, room.room_id, "Usage: !rss subscribe <url> [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]", "Usage: <code>!rss subscribe &lt;url&gt; [--keywords ...]</code>")
             return
 
-        feed_url = sub_args[0].strip()
+        feed_input = sub_args[0].strip()
+        fixture = find_fixture_by_slug_or_name(feed_input)
+        if fixture:
+            feed_url = fixture["url"]
+            preferred_name = fixture["name"]
+        else:
+            feed_url = feed_input
+            preferred_name = None
 
         # Parse flags using argparse-like strategy via standard shlex
         keywords, companies, geos, reps = None, None, None, None
@@ -191,13 +279,15 @@ class RSSPlugin(Plugin):
                 # Try parsing feed to check if valid and extract name
                 try:
                     parsed = feedparser.parse(feed_url)
-                    feed_name = parsed.feed.title if 'title' in parsed.feed else feed_url
+                    feed_name = preferred_name or (parsed.feed.title if 'title' in parsed.feed else feed_url)
                 except Exception:
-                    feed_name = feed_url
+                    feed_name = preferred_name or feed_url
                 
                 feed = RSSFeed(url=feed_url, name=feed_name)
                 session.add(feed)
                 await session.flush()
+            elif preferred_name and (not feed.name or feed.name == feed.url):
+                feed.name = preferred_name
 
             # 3. Create Subscription
             # Check if subscription already exists

@@ -32,13 +32,17 @@ async def main() -> None:
     from src.core.database import run_migrations
     await asyncio.to_thread(run_migrations)
 
+    # 4. Synchronize default RSS fixtures (major German news)
+    logger.info("Synchronizing default RSS fixtures...")
+    from src.fixtures.rss_feeds import seed_default_rss_feeds
+    await seed_default_rss_feeds()
+
     logger.info("Starting Matrix Bot Service...")
 
-    # 2. Instantiate PluginManager and register base plugins
+    # 5. Instantiate PluginManager and register base plugins
     plugin_manager = PluginManager()
 
     # Help plugin needs to know about other registered plugins
-
     from src.plugins.help import HelpPlugin
     from src.plugins.onboarding import OnboardingPlugin
     from src.plugins.stock import StockPlugin
@@ -53,6 +57,15 @@ async def main() -> None:
     plugin_manager.register_plugin(onboarding_plugin)
     plugin_manager.register_plugin(stock_plugin)
     plugin_manager.register_plugin(rss_plugin)
+
+    # HubSpot plugin (disabled by default)
+    if settings.enable_hubspot:
+        logger.info("HubSpot plugin is enabled by configuration.")
+        from src.plugins.hubspot import HubSpotPlugin
+        hubspot_plugin = HubSpotPlugin()
+        plugin_manager.register_plugin(hubspot_plugin)
+    else:
+        logger.info("HubSpot plugin is disabled.")
 
     # 3. Instantiate bot runner
     bot = MatrixBot(settings, plugin_manager)

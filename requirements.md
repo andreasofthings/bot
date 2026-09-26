@@ -172,3 +172,15 @@ The bot must compute the following technical indicators:
 *   **FR-NL-2.1: Gemini API Gateway:** The intent translator must interface with the Google Gemini API (e.g., `gemini-2.5-flash`) via an asynchronous HTTP POST handler using `httpx`.
 *   **FR-NL-2.2: API Key Configuration:** The router must be enabled dynamically by checking for a `GEMINI_API_KEY` configuration setting in the environment. If the API key is not configured, the bot must fallback to ignoring normal text messages and only responding to explicit `!` command structures, ensuring backwards compatibility and off-line functionality.
 
+---
+
+## 8. HubSpot CRM Integration (FR-CRM)
+
+### 8.1 Authentication & Connection Management
+*   **FR-CRM-1.1: Authentication Protocols:** The CRM plugin must support authentication with HubSpot via Private App Access Tokens (`Bearer` authentication), adhering to HubSpot's current developer standards.
+*   **FR-CRM-1.2: Multi-Source Credentials:** The plugin must support credentials provided through either environment configuration (`HUBSPOT_ACCESS_TOKEN`) or dynamic chat-based configuration (`!hubspot auth <token>`) persisted in the database.
+*   **FR-CRM-1.3: Token Verification & Account Diagnostics:** The plugin must verify token validity against the HubSpot API (`/account-info/v3/details` and `/oauth/v1/access-tokens/{token}`) and report status, Portal/Hub ID, data hosting region (e.g., NA1/EU1), account timezone/currency, and granted API scopes.
+*   **FR-CRM-1.4: Disconnect & Revocation:** Users must be able to disconnect or clear stored tokens via `!hubspot disconnect`.
+*   **FR-CRM-1.5: Security & Privacy:** Access tokens must never be logged or echoed in plain text in chat channels. Sensitive tokens must be masked in status outputs (e.g. `pat-na1-****...`).
+
+

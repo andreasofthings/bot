@@ -1,7 +1,8 @@
 import argparse
 import sys
+import urllib.parse
 from typing import List, Optional
-from pydantic import ValidationError
+from pydantic import ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -16,9 +17,11 @@ class Settings(BaseSettings):
     # 2. Database Configuration (configurable via CLI or env)
     database_url: str = "sqlite+aiosqlite:///data/bot.db"
 
-    # 3. Third-party APIs
+    # 3. Third-party APIs & Plugins
     stock_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
+    hubspot_access_token: Optional[str] = None
+    enable_hubspot: bool = False  # Disabled by default
 
     # 4. Admin & Productization
     admin_room_id: Optional[str] = None
@@ -37,6 +40,34 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore"
     )
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, v: str) -> str:
+        if not isinstance(v, str):
+            return v
+        url = v.strip("'\"").strip()
+        # Automatically adjust postgres connection scheme for asyncpg
+        if url.startswith("postgres://"):
+            url = "postgresql+asyncpg://" + url[len("postgres://"):]
+        elif url.startswith("postgresql://"):
+            url = "postgresql+asyncpg://" + url[len("postgresql://"):]
+
+        if "postgresql+asyncpg://" in url:
+            parsed = urllib.parse.urlsplit(url)
+            query_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            filtered_params = []
+            for k, val in query_params:
+                if k == "channel_binding":
+                    continue
+                if k == "sslmode":
+                    # asyncpg uses 'ssl' instead of 'sslmode'
+                    k = "ssl"
+                filtered_params.append((k, val))
+            new_query = urllib.parse.urlencode(filtered_params)
+            url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+
+        return url
 
     @property
     def admin_users_list(self) -> List[str]:

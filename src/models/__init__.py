@@ -3,6 +3,7 @@ from src.models.user import User, LicenseCode
 from src.models.room import Room
 from src.models.rss import RSSFeed, RSSSubscription, RSSHistory
 from src.models.stock import StockSubscription
+from src.models.hubspot import HubSpotConnection
 
 __all__ = [
     "Base",
@@ -13,4 +14,5 @@ __all__ = [
     "RSSSubscription",
     "RSSHistory",
     "StockSubscription",
+    "HubSpotConnection",
 ]

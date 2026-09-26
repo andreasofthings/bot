@@ -244,11 +244,15 @@ class MatrixBot:
             "- !stock list: Lists active indicator threshold alerts.\n"
             "- !stock check <ticker> [indicator] [period]: Inspects a stock or its technical indicators on-demand.\n"
             "- !stock subscribe <ticker> <indicator> <period> <condition> <threshold>: Subscribes to stock indicator alerts.\n"
-            "- !stock unsubscribe <id_or_ticker>: Cancels active stock alerts.\n\n"
+            "- !stock unsubscribe <id_or_ticker>: Cancels active stock alerts.\n"
+            "- !hubspot status: Checks HubSpot CRM connection and account diagnostics.\n"
+            "- !hubspot auth <token>: Connects a HubSpot Private App access token.\n"
+            "- !hubspot test: Pings the HubSpot API.\n"
+            "- !hubspot disconnect: Deactivates HubSpot CRM connection.\n\n"
             "Supported Indicators: RSI, SMA, EMA, MACD, BOLLINGER_HIGH, BOLLINGER_LOW\n"
             "Supported Conditions: ABOVE, BELOW, CROSS_ABOVE, CROSS_BELOW\n\n"
             "Your task is to translate user message intents into one of the structured commands above.\n"
-            "If the user message maps to a command, output ONLY the structured command itself (e.g. '!stock check SAP.DE' or '!rss list'), starting with '!' and with no markdown, formatting, or extra text.\n"
+            "If the user message maps to a command, output ONLY the structured command itself (e.g. '!stock check SAP.DE', '!rss list', or '!hubspot status'), starting with '!' and with no markdown, formatting, or extra text.\n"
             "If the message is a greeting, general chat, or does not map to any structured command, reply naturally with a conversational message explaining how you can help."
         )
 
