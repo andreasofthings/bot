@@ -39,33 +39,36 @@ async def main() -> None:
 
     logger.info("Starting Matrix Bot Service...")
 
-    # 5. Instantiate PluginManager and register base plugins
+    # 5. Instantiate PluginManager and register plugins
     plugin_manager = PluginManager()
 
-    # Help plugin needs to know about other registered plugins
-    from src.plugins.help import HelpPlugin
-    from src.plugins.onboarding import OnboardingPlugin
-    from src.plugins.stock import StockPlugin
-    from src.plugins.rss import RSSPlugin
+    if settings.enable_rss:
+        from src.plugins.rss import RSSPlugin
+        rss_plugin = RSSPlugin()
+        plugin_manager.register_plugin(rss_plugin)
+        logger.info("RSS feed plugin registered.")
 
-    help_plugin = HelpPlugin(plugin_manager)
-    onboarding_plugin = OnboardingPlugin()
-    stock_plugin = StockPlugin()
-    rss_plugin = RSSPlugin()
+    if settings.enable_help:
+        from src.plugins.help import HelpPlugin
+        plugin_manager.register_plugin(HelpPlugin(plugin_manager))
+        logger.info("Help plugin registered.")
 
-    plugin_manager.register_plugin(help_plugin)
-    plugin_manager.register_plugin(onboarding_plugin)
-    plugin_manager.register_plugin(stock_plugin)
-    plugin_manager.register_plugin(rss_plugin)
+    if settings.enable_onboarding:
+        from src.plugins.onboarding import OnboardingPlugin
+        plugin_manager.register_plugin(OnboardingPlugin())
+        logger.info("Onboarding plugin registered.")
 
-    # HubSpot plugin (disabled by default)
+    if settings.enable_stock:
+        from src.plugins.stock import StockPlugin
+        plugin_manager.register_plugin(StockPlugin())
+        logger.info("Stock plugin registered.")
+
     if settings.enable_hubspot:
-        logger.info("HubSpot plugin is enabled by configuration.")
         from src.plugins.hubspot import HubSpotPlugin
-        hubspot_plugin = HubSpotPlugin()
-        plugin_manager.register_plugin(hubspot_plugin)
-    else:
-        logger.info("HubSpot plugin is disabled.")
+        plugin_manager.register_plugin(HubSpotPlugin())
+        logger.info("HubSpot plugin registered.")
+
+    logger.info("Registered active plugins", plugins=list(plugin_manager.plugins.keys()))
 
     # 3. Instantiate bot runner
     bot = MatrixBot(settings, plugin_manager)

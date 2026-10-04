@@ -32,6 +32,10 @@ COPY --chown=botuser:botgroup pyproject.toml uv.lock ./
 # Synchronize dependencies (creates /app/.venv) without installing the local project
 RUN uv sync --no-install-project --no-dev --no-cache
 
+# Copy migration configuration and scripts
+COPY --chown=botuser:botgroup alembic.ini ./
+COPY --chown=botuser:botgroup migrations/ ./migrations
+
 # Copy source code
 COPY --chown=botuser:botgroup src/ ./src
 

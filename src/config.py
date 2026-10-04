@@ -21,7 +21,11 @@ class Settings(BaseSettings):
     stock_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
     hubspot_access_token: Optional[str] = None
-    enable_hubspot: bool = False  # Disabled by default
+    enable_rss: bool = True
+    enable_stock: bool = False
+    enable_hubspot: bool = False
+    enable_onboarding: bool = False
+    enable_help: bool = False
 
     # 4. Admin & Productization
     admin_room_id: Optional[str] = None

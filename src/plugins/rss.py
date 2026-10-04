@@ -44,7 +44,7 @@ class RSSPlugin(Plugin):
 
     @property
     def commands(self) -> List[str]:
-        return ["rss"]
+        return ["rss", "help"]
 
     async def on_message(
         self, 
@@ -54,7 +54,7 @@ class RSSPlugin(Plugin):
         command: str, 
         args: List[str]
     ) -> None:
-        if not args:
+        if command.lower() == "help" or not args or args[0].lower() in ["help", "--help", "-h"]:
             await self._send_usage(client, room.room_id)
             return
 
@@ -347,8 +347,10 @@ class RSSPlugin(Plugin):
                     RSSSubscription.feed_id == feed_id
                 )
             else:
-                # Query feed first by URL
-                q_feed = select(RSSFeed).where(RSSFeed.url == target)
+                # Query feed first by URL or fixture slug/alias
+                fixture = find_fixture_by_slug_or_name(target)
+                target_url = fixture["url"] if fixture else target
+                q_feed = select(RSSFeed).where(RSSFeed.url == target_url)
                 res_feed = await session.execute(q_feed)
                 feed_rec = res_feed.scalar_one_or_none()
                 if not feed_rec:
@@ -559,17 +561,28 @@ class RSSPlugin(Plugin):
         """Sends command assistance usage block."""
         await send_rich_message(
             client, room_id,
-            "RSS Commands:\n- !rss list\n- !rss subscribe <url> [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]\n- !rss unsubscribe <id_or_url>",
-            "<b>RSS capability commands:</b><ul>"
-            "<li><code>!rss list</code>: Lists active subscriptions in the room.</li>"
-            "<li><code>!rss subscribe &lt;url&gt; [filters]</code>: Subscribes target context with filters (comma-separated, e.g. <code>--companies Apple,Google</code>).</li>"
-            "<li><code>!rss unsubscribe &lt;id_or_url&gt;</code>: Removes an active subscription.</li>"
+            "RSS Commands:\n"
+            "- !rss feeds: Lists curated major German news feeds\n"
+            "- !rss list: Lists active subscriptions in this room\n"
+            "- !rss defaults: Subscribes this room to all top German news feeds\n"
+            "- !rss subscribe <url_or_slug> [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]\n"
+            "- !rss unsubscribe <id_or_slug_or_url>: Removes an active subscription\n"
+            "- !help: Shows this usage guide",
+            "<b>📰 RSS Capability Commands:</b><ul>"
+            "<li><code>!rss feeds</code>: Lists curated major German news feeds (Tagesschau, Spiegel, FAZ, Zeit, etc.).</li>"
+            "<li><code>!rss list</code>: Lists active subscriptions in this room.</li>"
+            "<li><code>!rss defaults</code>: Quickly subscribes this room to top German news feeds.</li>"
+            "<li><code>!rss subscribe &lt;url_or_slug&gt; [filters]</code>: Subscribes with optional filters (e.g. <code>!rss subscribe tagesschau</code> or <code>!rss subscribe heise --keywords KI,Security</code>).</li>"
+            "<li><code>!rss unsubscribe &lt;id_or_slug_or_url&gt;</code>: Removes an active subscription.</li>"
+            "<li><code>!help</code>: Displays this help message.</li>"
             "</ul>"
         )
 
     def get_help(self) -> str:
         return (
-            "• <b>!rss list</b>: Lists active subscriptions for this context.<br>"
-            "• <b>!rss subscribe &lt;url&gt; [filters]</b>: Subscribes this channel/user to an RSS URL with filtering options.<br>"
-            "• <b>!rss unsubscribe &lt;id_or_url&gt;</b>: Unsubscribes from a feed."
+            "• <b>!rss feeds</b>: Lists curated major German news feeds (Tagesschau, Spiegel, FAZ, Zeit, etc.).<br>"
+            "• <b>!rss defaults</b>: Subscribes this room to top German news feeds.<br>"
+            "• <b>!rss list</b>: Lists active subscriptions for this room/context.<br>"
+            "• <b>!rss subscribe &lt;url_or_slug&gt; [filters]</b>: Subscribes to an RSS feed URL or slug alias with filtering options.<br>"
+            "• <b>!rss unsubscribe &lt;id_or_slug_or_url&gt;</b>: Unsubscribes from a feed."
         )

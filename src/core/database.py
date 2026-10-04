@@ -90,6 +90,9 @@ def run_migrations() -> None:
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
     ini_path = os.path.join(project_root, "alembic.ini")
     
+    if not os.path.exists(ini_path):
+        raise FileNotFoundError(f"Alembic configuration file not found at: {ini_path}")
+
     logger.info("Running database migrations programmatically...", ini_path=ini_path)
     
     alembic_cfg = Config(ini_path)

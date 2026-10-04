@@ -8,6 +8,20 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+async def send_rich_message(client: AsyncClient, room_id: str, plain: str, html: str) -> None:
+    """Helper to send formatted HTML messages to a Matrix room."""
+    await client.room_send(
+        room_id=room_id,
+        message_type="m.room.message",
+        content={
+            "msgtype": "m.text",
+            "format": "org.matrix.custom.html",
+            "body": plain,
+            "formatted_body": html,
+        },
+    )
+
+
 class MatrixBot:
     """Core Matrix bot client runner using matrix-nio."""
 
@@ -149,55 +163,54 @@ class MatrixBot:
 
         body = event.body.strip()
         
-        # Check user onboarding status
-        from src.core.database import get_db_session
-        from src.models.user import User
+        # Check user onboarding status only if onboarding plugin is active
+        if "onboarding" in self.plugin_manager.plugins:
+            from src.core.database import get_db_session
+            from src.models.user import User
 
-        async with get_db_session() as session:
-            user = await session.get(User, event.sender)
+            async with get_db_session() as session:
+                user = await session.get(User, event.sender)
 
-            # Identify platform source (Signal, WhatsApp, Matrix)
-            platform = "Matrix"
-            if "signal_" in event.sender:
-                platform = "Signal"
-            elif "whatsapp_" in event.sender:
-                platform = "WhatsApp"
+                # Identify platform source (Signal, WhatsApp, Matrix)
+                platform = "Matrix"
+                if "signal_" in event.sender:
+                    platform = "Signal"
+                elif "whatsapp_" in event.sender:
+                    platform = "WhatsApp"
 
-            is_completed = user is not None and user.onboarding_state == "COMPLETED"
+                is_completed = user is not None and user.onboarding_state == "COMPLETED"
 
-            if not is_completed:
-                # Check if it's a command that bypasses onboarding
-                is_bypass = False
-                if body.startswith("!"):
-                    parts = body[1:].split()
-                    if parts:
-                        cmd = parts[0].lower()
-                        if cmd in ["help", "status", "activate"]:
-                            is_bypass = True
+                if not is_completed:
+                    # Check if it's a command that bypasses onboarding
+                    is_bypass = False
+                    if body.startswith("!"):
+                        parts = body[1:].split()
+                        if parts:
+                            cmd = parts[0].lower()
+                            if cmd in ["help", "status", "activate"]:
+                                is_bypass = True
 
-                if not is_bypass:
-                    # Determine if this is a private context (DM)
-                    is_dm = len(room.users) <= 2
-                    
-                    if is_dm:
-                        from src.plugins.onboarding import handle_onboarding_message
-                        await handle_onboarding_message(self.client, room, event, user, platform)
-                        return
-                    else:
-                        # In a public channel, warn the user if they tried to run a command
-                        if body.startswith("!"):
-                            from src.plugins.onboarding import send_rich_message
-                            html_msg = f"Hello <a href='https://matrix.to/#/{event.sender}'>{event.sender}</a>! Please start a private chat (DM) with me to complete onboarding before using commands."
-                            plain_msg = f"Hello {event.sender}! Please start a private chat (DM) with me to complete onboarding before using commands."
-                            await send_rich_message(self.client, room.room_id, plain_msg, html_msg)
-                        return
+                    if not is_bypass:
+                        # Determine if this is a private context (DM)
+                        is_dm = len(room.users) <= 2
+                        
+                        if is_dm:
+                            from src.plugins.onboarding import handle_onboarding_message
+                            await handle_onboarding_message(self.client, room, event, user, platform)
+                            return
+                        else:
+                            # In a public channel, warn the user if they tried to run a command
+                            if body.startswith("!"):
+                                html_msg = f"Hello <a href='https://matrix.to/#/{event.sender}'>{event.sender}</a>! Please start a private chat (DM) with me to complete onboarding before using commands."
+                                plain_msg = f"Hello {event.sender}! Please start a private chat (DM) with me to complete onboarding before using commands."
+                                await send_rich_message(self.client, room.room_id, plain_msg, html_msg)
+                            return
 
-        # If onboarding is completed, parse command
+        # If onboarding is completed or not active, parse command
         if not body.startswith("!"):
             if self.settings.gemini_api_key:
                 interpreted_command = await self._route_natural_language(room, event, body)
                 if interpreted_command:
-                    from src.plugins.onboarding import send_rich_message
                     html = f"<i>(Interpreted: <code>{interpreted_command}</code>)</i>"
                     plain = f"(Interpreted: {interpreted_command})"
                     await send_rich_message(self.client, room.room_id, plain, html)
@@ -231,28 +244,43 @@ class MatrixBot:
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={self.settings.gemini_api_key}"
         
+        active_plugins = self.plugin_manager.plugins
+        cmd_lines = ["- !help: Shows general command assistance."]
+        if "rss" in active_plugins:
+            cmd_lines.extend([
+                "- !rss list: Lists current RSS subscriptions.",
+                "- !rss feeds: Lists available curated German news feeds.",
+                "- !rss defaults: Subscribes room to top German news feeds.",
+                "- !rss subscribe <url_or_slug> [--keywords k1] [--companies c1] [--geo g1] [--representatives r1]: Subscribes room/user to feed URL or slug alias with optional relevance filters.",
+                "- !rss unsubscribe <id_or_slug_or_url>: Cancels RSS feed subscription.",
+            ])
+        if "stock" in active_plugins:
+            cmd_lines.extend([
+                "- !stock list: Lists active indicator threshold alerts.",
+                "- !stock check <ticker> [indicator] [period]: Inspects a stock or its technical indicators on-demand.",
+                "- !stock subscribe <ticker> <indicator> <period> <condition> <threshold>: Subscribes to stock indicator alerts.",
+                "- !stock unsubscribe <id_or_ticker>: Cancels active stock alerts.",
+            ])
+        if "hubspot" in active_plugins:
+            cmd_lines.extend([
+                "- !hubspot status: Checks HubSpot CRM connection and account diagnostics.",
+                "- !hubspot auth <token>: Connects a HubSpot Private App access token.",
+                "- !hubspot test: Pings the HubSpot API.",
+                "- !hubspot disconnect: Deactivates HubSpot CRM connection.",
+            ])
+        if "onboarding" in active_plugins:
+            cmd_lines.extend([
+                "- !status: Shows current service status.",
+                "- !activate <code>: Upgrades user licensing tier.",
+                "- !forgetme: Wipes database user profile.",
+            ])
+
+        cmds_str = "\n".join(cmd_lines)
         system_instruction = (
             "You are the Natural Language Router for a Matrix capability bot.\n"
-            "The bot supports these commands:\n"
-            "- !help: Shows general command assistance.\n"
-            "- !status: Shows current service status.\n"
-            "- !activate <code>: Upgrades user licensing tier.\n"
-            "- !forgetme: Wipes database user profile.\n"
-            "- !rss list: Lists current RSS subscriptions.\n"
-            "- !rss subscribe <url> [--keywords k1] [--companies c1] [--geo g1] [--representatives r1]: Subscribes room/user to feed URL with optional comma-separated relevance filters.\n"
-            "- !rss unsubscribe <id_or_url>: Cancels RSS feed subscription.\n"
-            "- !stock list: Lists active indicator threshold alerts.\n"
-            "- !stock check <ticker> [indicator] [period]: Inspects a stock or its technical indicators on-demand.\n"
-            "- !stock subscribe <ticker> <indicator> <period> <condition> <threshold>: Subscribes to stock indicator alerts.\n"
-            "- !stock unsubscribe <id_or_ticker>: Cancels active stock alerts.\n"
-            "- !hubspot status: Checks HubSpot CRM connection and account diagnostics.\n"
-            "- !hubspot auth <token>: Connects a HubSpot Private App access token.\n"
-            "- !hubspot test: Pings the HubSpot API.\n"
-            "- !hubspot disconnect: Deactivates HubSpot CRM connection.\n\n"
-            "Supported Indicators: RSI, SMA, EMA, MACD, BOLLINGER_HIGH, BOLLINGER_LOW\n"
-            "Supported Conditions: ABOVE, BELOW, CROSS_ABOVE, CROSS_BELOW\n\n"
+            f"The bot supports these commands:\n{cmds_str}\n\n"
             "Your task is to translate user message intents into one of the structured commands above.\n"
-            "If the user message maps to a command, output ONLY the structured command itself (e.g. '!stock check SAP.DE', '!rss list', or '!hubspot status'), starting with '!' and with no markdown, formatting, or extra text.\n"
+            "If the user message maps to a command, output ONLY the structured command itself (e.g. '!rss list', '!rss feeds', or '!rss subscribe tagesschau'), starting with '!' and with no markdown, formatting, or extra text.\n"
             "If the message is a greeting, general chat, or does not map to any structured command, reply naturally with a conversational message explaining how you can help."
         )
 
@@ -282,12 +310,10 @@ class MatrixBot:
                     if output_text.startswith("!"):
                         return output_text
                     else:
-                        from src.plugins.onboarding import send_rich_message
                         await send_rich_message(self.client, room.room_id, output_text, output_text)
                         return None
                 else:
                     logger.error("Gemini API error response", status=resp.status_code, body=resp.text)
-                    from src.plugins.onboarding import send_rich_message
                     await send_rich_message(self.client, room.room_id, "API Error: Conversational router failed.", "❌ <b>API Error:</b> Natural language router request failed.")
                     return None
         except Exception as e:
