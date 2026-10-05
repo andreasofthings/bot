@@ -38,6 +38,15 @@ def get_engine() -> AsyncEngine:
     return _engine
 
 
+async def close_engine() -> None:
+    """Disposes the database connection pool and resets global engine singletons."""
+    global _engine, _session_maker
+    if _engine is not None:
+        await _engine.dispose()
+        _engine = None
+        _session_maker = None
+
+
 def get_sessionmaker() -> async_sessionmaker:
     """Retrieves or initializes the global async session factory."""
     global _session_maker

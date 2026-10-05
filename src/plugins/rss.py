@@ -5,12 +5,12 @@ import shlex
 import re
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, func
 from sqlalchemy.orm import joinedload
 from nio import AsyncClient, MatrixRoom, RoomMessageText
 from src.core.plugin import Plugin
 from src.core.database import get_db_session
-from src.models.rss import RSSFeed, RSSSubscription, RSSHistory
+from src.models.rss import RSSFeed, RSSSubscription, RSSHistory, RSSQueueItem
 from src.models.user import User
 from src.config import load_settings
 from src.fixtures.rss_feeds import get_default_rss_fixtures, find_fixture_by_slug_or_name
@@ -32,11 +32,22 @@ async def send_rich_message(client: AsyncClient, room_id: str, plain: str, html:
     )
 
 class RSSPlugin(Plugin):
-    """RSS Syndication capability plugin. Parses feeds and runs entity relevance filters."""
+    """RSS Syndication capability plugin. Ingests feeds into a queue and paces delivery predictably."""
 
-    def __init__(self):
-        self._last_tick_time = 0
-        self._poll_interval_seconds = 900  # 15 minutes default
+    def __init__(self, settings: Optional[Any] = None):
+        self.settings = settings or load_settings()
+        self._poll_interval_seconds = getattr(self.settings, "rss_poll_interval_seconds", 3600)  # Default 60 minutes
+        self._min_delivery_interval = getattr(self.settings, "rss_min_delivery_interval_seconds", 5)  # Min seconds between alerts
+        self._max_delivery_interval = getattr(self.settings, "rss_max_delivery_interval_seconds", 3600)
+        self._default_channel = getattr(self.settings, "rss_default_channel", None)
+
+        self._last_poll_time: float = 0.0
+        self._last_delivery_time: float = 0.0
+        self._current_interval: float = 60.0
+        self._is_running: bool = True
+        self._dispatcher_task: Optional[asyncio.Task] = None
+        self._new_item_event = asyncio.Event()
+        self._poll_lock = asyncio.Lock()
 
     @property
     def plugin_id(self) -> str:
@@ -84,7 +95,17 @@ class RSSPlugin(Plugin):
         elif sub_cmd == "unsubscribe":
             await self._handle_unsubscribe(client, room, event, args[1:])
             return
-        
+
+        # 6. Command: !rss queue / !rss status
+        elif sub_cmd in ["queue", "status", "q"]:
+            await self._handle_queue_status(client, room, event)
+            return
+
+        # 7. Command: !rss poll / !rss sync
+        elif sub_cmd in ["poll", "sync", "refresh"]:
+            await self._handle_poll_now(client, room, event)
+            return
+
         else:
             await self._send_usage(client, room.room_id)
 
@@ -370,88 +391,319 @@ class RSSPlugin(Plugin):
             await session.delete(subscription)
             await send_rich_message(client, room.room_id, "Successfully unsubscribed.", "Successfully unsubscribed.")
 
-    async def on_tick(self, client: AsyncClient) -> None:
-        """Triggered periodically by the bot scheduler. Ingests and processes feeds."""
-        now_ts = int(datetime.now().timestamp())
-        if now_ts - self._last_tick_time < self._poll_interval_seconds:
-            return  # Wait until polling interval elapsed
-        
-        self._last_tick_time = now_ts
-        logger.info("Executing RSS feed polling task...")
-
-        # 1. Fetch all feeds in a short-lived query session
+    async def _handle_queue_status(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
+        """Reports the current status of the RSS delivery queue and pacing rate."""
         async with get_db_session() as session:
-            q_feeds = select(RSSFeed).join(RSSSubscription).group_by(RSSFeed.id)
-            res_feeds = await session.execute(q_feeds)
-            feeds = [{"id": f.id, "url": f.url, "name": f.name} for f in res_feeds.scalars().all()]
+            pending_q = select(func.count(RSSQueueItem.id)).where(RSSQueueItem.status == "pending")
+            delivered_q = select(func.count(RSSQueueItem.id)).where(RSSQueueItem.status == "delivered")
+            
+            pending_count = (await session.execute(pending_q)).scalar() or 0
+            delivered_count = (await session.execute(delivered_q)).scalar() or 0
+            
+            # Fetch next 3 pending articles
+            next_items_q = (
+                select(RSSQueueItem)
+                .where(RSSQueueItem.status == "pending")
+                .order_by(RSSQueueItem.created_at.asc(), RSSQueueItem.id.asc())
+                .limit(3)
+            )
+            next_items = (await session.execute(next_items_q)).scalars().all()
 
-        if not feeds:
-            logger.debug("No active RSS feeds to poll.")
-            return
+        now_ts = datetime.now().timestamp()
+        time_until_next_poll = max(0, int((self._last_poll_time + self._poll_interval_seconds) - now_ts))
+        mins_until_poll = time_until_next_poll // 60
+        secs_until_poll = time_until_next_poll % 60
 
-        async with httpx.AsyncClient(timeout=10.0) as http_client:
-            for feed_dict in feeds:
-                # 2. Process each feed in its own isolated transaction session
+        rate_str = (
+            f"1 article every {int(self._current_interval)}s"
+            if self._current_interval < 60
+            else f"1 article every {round(self._current_interval / 60, 1)}m ({int(self._current_interval)}s)"
+        )
+
+        html = [
+            "<b>📊 RSS Delivery Queue & Pacing Status</b>",
+            f"• <b>Pending Articles in Queue:</b> <code>{pending_count}</code>",
+            f"• <b>Total Delivered:</b> <code>{delivered_count}</code>",
+            f"• <b>Current Output Rate:</b> <code>{rate_str}</code>",
+            f"• <b>Poll Cycle Interval:</b> <code>{self._poll_interval_seconds // 60} minutes</code>",
+            f"• <b>Next Feed Poll In:</b> <code>{mins_until_poll}m {secs_until_poll}s</code>",
+        ]
+
+        if next_items:
+            html.append("<br><b>Up Next in Queue:</b><ul>")
+            for idx, item in enumerate(next_items, 1):
+                html.append(f"<li>#{idx}: <b>{item.feed_name or 'Feed'}</b>: <a href='{item.link}'>{item.title}</a> (target: <code>{item.subscriber_id}</code>)</li>")
+            html.append("</ul>")
+        elif pending_count == 0:
+            html.append("<br><i>Queue is currently empty. Next articles will be enqueued on the upcoming poll cycle.</i>")
+
+        plain = (
+            f"RSS Queue Status:\n"
+            f"- Pending in Queue: {pending_count}\n"
+            f"- Total Delivered: {delivered_count}\n"
+            f"- Output Rate: {rate_str}\n"
+            f"- Next Poll in: {mins_until_poll}m {secs_until_poll}s"
+        )
+        await send_rich_message(client, room.room_id, plain, "<br>".join(html))
+
+    async def _handle_poll_now(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
+        """Triggers an immediate poll of all subscribed feeds and recalculates pacing."""
+        await send_rich_message(
+            client, room.room_id,
+            "Triggering RSS feed poll now...",
+            "⏳ <b>Polling all subscribed RSS feeds now...</b>"
+        )
+        enqueued = await self.poll_all_feeds(client)
+        msg_html = f"✅ <b>Feed poll completed!</b> Enqueued <code>{enqueued}</code> new articles for paced delivery."
+        msg_plain = f"Feed poll completed. Enqueued {enqueued} new articles for paced delivery."
+        await send_rich_message(client, room.room_id, msg_plain, msg_html)
+
+    async def stop(self) -> None:
+        """Gracefully cancels dispatcher worker and cleans up background loops."""
+        logger.info("Stopping RSSPlugin background tasks...")
+        self._is_running = False
+        self._new_item_event.set()
+        if self._dispatcher_task:
+            self._dispatcher_task.cancel()
+            try:
+                await self._dispatcher_task
+            except asyncio.CancelledError:
+                pass
+            self._dispatcher_task = None
+
+    async def on_tick(self, client: AsyncClient) -> None:
+        """Periodic background callback triggered by the bot's scheduler.
+        Ensures the queue dispatcher is alive and triggers feed polling when interval elapses.
+        """
+        # 1. Ensure queue dispatcher worker is active
+        if self._dispatcher_task is None or self._dispatcher_task.done():
+            self._dispatcher_task = asyncio.create_task(self._run_queue_dispatcher(client))
+
+        # 2. Check if polling interval has elapsed
+        now_ts = datetime.now().timestamp()
+        if self._last_poll_time == 0.0 or (now_ts - self._last_poll_time >= self._poll_interval_seconds):
+            await self.poll_all_feeds(client)
+
+    async def poll_all_feeds(self, client: Optional[AsyncClient] = None) -> int:
+        """Polls external RSS feeds and enqueues matched articles into the delivery queue.
+
+        Returns:
+            The number of newly enqueued articles.
+        """
+        async with self._poll_lock:
+            now_ts = datetime.now().timestamp()
+            self._last_poll_time = now_ts
+            logger.info("Executing RSS feed polling task...", poll_interval=self._poll_interval_seconds)
+
+            # 1. Fetch active feeds with subscriptions
+            async with get_db_session() as session:
+                q_feeds = select(RSSFeed).join(RSSSubscription).group_by(RSSFeed.id)
+                res_feeds = await session.execute(q_feeds)
+                feeds = [{"id": f.id, "url": f.url, "name": f.name} for f in res_feeds.scalars().all()]
+
+            if not feeds:
+                logger.debug("No active RSS feeds to poll.")
+                return 0
+
+            new_articles_count = 0
+
+            async with httpx.AsyncClient(timeout=15.0) as http_client:
+                for feed_dict in feeds:
+                    async with get_db_session() as session:
+                        try:
+                            feed = await session.get(RSSFeed, feed_dict["id"])
+                            if not feed:
+                                continue
+
+                            logger.info("Polling feed URL", url=feed.url)
+                            resp = await http_client.get(feed.url)
+                            if resp.status_code != 200:
+                                logger.warning("Feed poll status error", url=feed.url, status=resp.status_code)
+                                continue
+
+                            parsed = feedparser.parse(resp.text)
+                            if not feed.name and "title" in parsed.feed:
+                                feed.name = parsed.feed.title
+                            feed.last_polled = datetime.now()
+
+                            # Process up to 25 latest entries
+                            for entry in parsed.entries[:25]:
+                                entry_id = entry.id if "id" in entry else (entry.link if "link" in entry else entry.title)
+                                if not entry_id:
+                                    continue
+
+                                # Check history to prevent duplicate ingestion
+                                q_hist = select(RSSHistory).where(
+                                    RSSHistory.entry_id == entry_id,
+                                    RSSHistory.feed_id == feed.id
+                                )
+                                res_hist = await session.execute(q_hist)
+                                if res_hist.scalar_one_or_none():
+                                    continue
+
+                                # Mark in history with nested transaction
+                                try:
+                                    async with session.begin_nested():
+                                        history_item = RSSHistory(entry_id=entry_id, feed_id=feed.id)
+                                        session.add(history_item)
+                                except Exception:
+                                    logger.debug("Duplicate RSS entry detected during concurrent write; skipping", entry_id=entry_id)
+                                    continue
+
+                                # Check matching subscriptions for this feed
+                                q_subs = select(RSSSubscription).where(RSSSubscription.feed_id == feed.id)
+                                res_subs = await session.execute(q_subs)
+                                subscriptions = res_subs.scalars().all()
+
+                                for sub in subscriptions:
+                                    is_match, reasons = self._evaluate_relevance(entry, sub)
+                                    if is_match:
+                                        title = entry.get("title", "No Title")
+                                        link = entry.get("link", "#")
+                                        summary = entry.get("summary", entry.get("description", ""))
+                                        
+                                        # Queue article into delivery queue
+                                        queue_item = RSSQueueItem(
+                                            subscriber_id=sub.subscriber_id,
+                                            feed_id=feed.id,
+                                            entry_id=entry_id,
+                                            title=title,
+                                            link=link,
+                                            summary=summary,
+                                            matches=reasons,
+                                            feed_name=feed.name or feed.url,
+                                            status="pending"
+                                        )
+                                        session.add(queue_item)
+                                        new_articles_count += 1
+                                        logger.info(
+                                            "Enqueued RSS article match",
+                                            title=title,
+                                            subscriber=sub.subscriber_id,
+                                            feed=feed.name
+                                        )
+
+                            await session.commit()
+                        except Exception as e:
+                            logger.exception("Failed to poll feed", url=feed_dict["url"], error=str(e))
+
+            if new_articles_count > 0:
+                self._new_item_event.set()
+                logger.info("RSS feed polling complete", enqueued=new_articles_count)
+            else:
+                logger.info("RSS feed polling complete: No new articles enqueued.")
+
+            return new_articles_count
+
+    async def _run_queue_dispatcher(self, client: AsyncClient) -> None:
+        """Background worker that continuously outputs queued articles one-by-one at a calculated predictable rate."""
+        logger.info("Starting RSS queue output dispatcher worker...")
+
+        while self._is_running:
+            try:
+                # 1. Check pending items count
                 async with get_db_session() as session:
+                    count_q = select(func.count(RSSQueueItem.id)).where(RSSQueueItem.status == "pending")
+                    count_res = await session.execute(count_q)
+                    pending_count = count_res.scalar() or 0
+
+                # If queue is empty, wait for new items or timeout
+                if pending_count == 0:
+                    self._new_item_event.clear()
                     try:
-                        # Fetch the feed record inside this session
-                        feed = await session.get(RSSFeed, feed_dict["id"])
-                        if not feed:
-                            continue
+                        await asyncio.wait_for(self._new_item_event.wait(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
 
-                        logger.info("Polling feed URL", url=feed.url)
-                        resp = await http_client.get(feed.url)
-                        if resp.status_code != 200:
-                            logger.warning("Feed poll status error", url=feed.url, status=resp.status_code)
-                            continue
+                # 2. Calculate dynamic pacing interval
+                now_ts = datetime.now().timestamp()
+                time_until_next_poll = (self._last_poll_time + self._poll_interval_seconds) - now_ts
+                if time_until_next_poll <= 0:
+                    time_until_next_poll = self._poll_interval_seconds
 
-                        # Parse RSS feed content
-                        parsed = feedparser.parse(resp.text)
-                        
-                        # Update feed metadata name if missing
-                        if not feed.name and 'title' in parsed.feed:
-                            feed.name = parsed.feed.title
+                # Spread pending items evenly across the time remaining until the next poll
+                ideal_interval = time_until_next_poll / pending_count
 
-                        # Update last polled time
-                        feed.last_polled = datetime.now()
+                # Clamp within sensible limits
+                interval = max(self._min_delivery_interval, min(ideal_interval, self._max_delivery_interval))
+                self._current_interval = interval
 
-                        # Process feed items
-                        for entry in parsed.entries[:15]:  # Limit to latest 15 items per poll
-                            entry_id = entry.id if 'id' in entry else (entry.link if 'link' in entry else entry.title)
-                            if not entry_id:
-                                continue
+                # 3. Fetch the oldest pending article to deliver
+                item_to_deliver = None
+                async with get_db_session() as session:
+                    item_q = (
+                        select(RSSQueueItem)
+                        .where(RSSQueueItem.status == "pending")
+                        .order_by(RSSQueueItem.created_at.asc(), RSSQueueItem.id.asc())
+                        .limit(1)
+                    )
+                    res_item = await session.execute(item_q)
+                    item_to_deliver = res_item.scalar_one_or_none()
+                    if item_to_deliver:
+                        item_id = item_to_deliver.id
+                        subscriber_id = item_to_deliver.subscriber_id
+                        title = item_to_deliver.title
+                        link = item_to_deliver.link
+                        summary = item_to_deliver.summary
+                        matches = item_to_deliver.matches
+                        feed_name = item_to_deliver.feed_name
 
-                            # Check if item was already processed
-                            q_hist = select(RSSHistory).where(
-                                RSSHistory.entry_id == entry_id,
-                                RSSHistory.feed_id == feed.id
-                            )
-                            res_hist = await session.execute(q_hist)
-                            if res_hist.scalar_one_or_none():
-                                continue  # Already processed
+                if not item_to_deliver:
+                    continue
 
-                            # Save to history with isolated nested transaction check
-                            try:
-                                async with session.begin_nested():
-                                    history_item = RSSHistory(entry_id=entry_id, feed_id=feed.id)
-                                    session.add(history_item)
-                            except Exception:
-                                logger.debug("Duplicate RSS entry detected during concurrent write; skipping", entry_id=entry_id)
-                                continue
+                # 4. Deliver the article to Matrix
+                logger.info(
+                    "Delivering queued RSS article",
+                    item_id=item_id,
+                    title=title,
+                    subscriber=subscriber_id,
+                    pending_remaining=pending_count - 1,
+                    pacing_interval_sec=round(interval, 1)
+                )
 
-                            # Match against active subscriptions for this feed
-                            q_subs = select(RSSSubscription).where(RSSSubscription.feed_id == feed.id)
-                            res_subs = await session.execute(q_subs)
-                            subscriptions = res_subs.scalars().all()
+                delivery_success = False
+                delivery_error = None
+                try:
+                    await self._deliver_alert_from_queue(
+                        client=client,
+                        subscriber_id=subscriber_id,
+                        feed_name=feed_name,
+                        title=title,
+                        link=link,
+                        summary=summary,
+                        matches=matches or []
+                    )
+                    delivery_success = True
+                    self._last_delivery_time = datetime.now().timestamp()
+                except Exception as e:
+                    delivery_error = str(e)
+                    logger.error("Failed to deliver queued RSS article", item_id=item_id, error=delivery_error)
 
-                            for sub in subscriptions:
-                                is_match, reasons = self._evaluate_relevance(entry, sub)
-                                if is_match:
-                                    logger.info("Relevance match found!", entry_title=entry.get('title'), subscriber=sub.subscriber_id)
-                                    await self._deliver_alert(client, sub.subscriber_id, feed, entry, reasons)
+                # 5. Update item status in database
+                async with get_db_session() as session:
+                    db_item = await session.get(RSSQueueItem, item_id)
+                    if db_item:
+                        db_item.attempts += 1
+                        if delivery_success:
+                            db_item.status = "delivered"
+                            db_item.delivered_at = datetime.now()
+                        else:
+                            db_item.last_error = delivery_error
+                            if db_item.attempts >= 5:
+                                db_item.status = "failed"
+                                logger.warning("RSS queue item marked as failed after max attempts", item_id=item_id)
+                        await session.commit()
 
-                    except Exception as e:
-                        logger.exception("Failed to poll feed", url=feed_dict["url"], error=str(e))
+                # 6. Sleep for the paced interval before next delivery
+                await asyncio.sleep(interval)
+
+            except asyncio.CancelledError:
+                logger.info("RSS queue dispatcher loop cancelled.")
+                break
+            except Exception as e:
+                logger.exception("Unexpected error in RSS queue dispatcher", error=str(e))
+                await asyncio.sleep(10.0)
 
     def _evaluate_relevance(self, entry: Any, sub: RSSSubscription) -> tuple[bool, List[str]]:
         """Evaluates whether a feed entry matches a subscription's filters."""
@@ -475,7 +727,6 @@ class RSSPlugin(Plugin):
 
         # Helper for word boundary regex matches (prevents matching "India" in "Indiana")
         def word_match(pattern: str, text: str) -> bool:
-            # Escape pattern and enforce word boundaries
             escaped = re.escape(pattern)
             return bool(re.search(rf"\b{escaped}\b", text, re.IGNORECASE))
 
@@ -501,67 +752,82 @@ class RSSPlugin(Plugin):
             return True, matches
         return False, []
 
-    async def _deliver_alert(self, client: AsyncClient, subscriber_id: str, feed: RSSFeed, entry: Any, reasons: List[str]) -> None:
-        """Sends formatted HTML alert details to the matched subscriber room or user DM."""
-        # Resolve target room ID
-        target_room_id = None
-        
-        # If subscriber_id is room ID/alias directly
+    def _resolve_target_room(self, client: AsyncClient, subscriber_id: str) -> Optional[str]:
+        """Resolves a subscriber identifier to a valid Matrix room ID or alias."""
+        # 1. Direct room ID or alias
         if subscriber_id.startswith("!") or subscriber_id.startswith("#"):
-            target_room_id = subscriber_id
-        else:
-            # Check if subscriber_id is "Product" or similar name
-            # We can search room names or canonical aliases
+            return subscriber_id
+
+        # 2. Match against client rooms by name or canonical alias
+        if hasattr(client, "rooms"):
             for room_id, room in client.rooms.items():
                 if room.name == subscriber_id or room.canonical_alias == subscriber_id:
-                    target_room_id = room_id
-                    break
-            
-            # If not found, check if it's a registered user ID (send DM)
-            if not target_room_id and subscriber_id.startswith("@"):
-                # Search for a direct room containing the user
+                    return room_id
+
+            # 3. Direct user DM
+            if subscriber_id.startswith("@"):
                 for room_id, room in client.rooms.items():
                     if len(room.users) <= 2 and subscriber_id in room.users:
-                        target_room_id = room_id
-                        break
-                        
+                        return room_id
+
+        # 4. Configured default channel
+        if self._default_channel:
+            return self._default_channel
+
+        # 5. Startup rooms list
+        if self.settings.startup_rooms_list:
+            return self.settings.startup_rooms_list[0]
+
+        # 6. Fallback default
+        return "#sauna:pramari.de"
+
+    async def _deliver_alert_from_queue(
+        self,
+        client: AsyncClient,
+        subscriber_id: str,
+        feed_name: Optional[str],
+        title: str,
+        link: str,
+        summary: Optional[str],
+        matches: List[str]
+    ) -> None:
+        """Sends formatted HTML alert details to the matched subscriber room or user DM."""
+        target_room_id = self._resolve_target_room(client, subscriber_id)
         if not target_room_id:
-            if subscriber_id == "Product":
-                # Fallback mapping for prefilled subscriptions
-                target_room_id = "#sauna:pramari.de"
-            else:
-                logger.warning("Could not resolve target room for subscriber", subscriber_id=subscriber_id)
-                return
+            logger.warning("Could not resolve target room for subscriber", subscriber_id=subscriber_id)
+            return
 
-        title = entry.get("title", "No Title")
-        link = entry.get("link", "#")
-        summary = entry.get("summary", entry.get("description", ""))
-        
-        # Simple HTML tag stripping for summary snippet
-        summary_clean = re.sub(r"<[^>]+>", "", summary)[:300]
-        if len(summary) > 300:
-            summary_clean += "..."
+        summary_clean = ""
+        if summary:
+            summary_clean = re.sub(r"<[^>]+>", "", summary)[:300]
+            if len(summary) > 300:
+                summary_clean += "..."
 
-        reasons_str = ", ".join(reasons)
+        reasons_str = ", ".join(matches) if matches else "Subscription feed update"
 
         html_body = (
-            f"📰 <b>New Article Match: {feed.name or feed.url}</b><br>"
+            f"📰 <b>{feed_name or 'News Feed'}</b><br>"
             f"<b><a href='{link}'>{title}</a></b><br>"
-            f"<i>Matches: {reasons_str}</i><br><br>"
-            f"Snippet:<br><blockquote>{summary_clean}</blockquote>"
+            f"<i>Matches: {reasons_str}</i>"
         )
-        plain_body = f"New Article Match: {feed.name or feed.url}\n{title}\nLink: {link}\nMatches: {reasons_str}"
+        if summary_clean:
+            html_body += f"<br><br><blockquote>{summary_clean}</blockquote>"
+
+        plain_body = f"📰 {feed_name or 'News Feed'}: {title}\n{link}\nMatches: {reasons_str}"
 
         try:
             await send_rich_message(client, target_room_id, plain_body, html_body)
         except Exception as e:
             logger.error("Failed to deliver RSS notification", target=target_room_id, error=str(e))
+            raise
 
     async def _send_usage(self, client: AsyncClient, room_id: str) -> None:
         """Sends command assistance usage block."""
         await send_rich_message(
             client, room_id,
             "RSS Commands:\n"
+            "- !rss queue: Displays current delivery queue size, output rate, and pacing status\n"
+            "- !rss poll: Triggers an immediate poll of all feeds\n"
             "- !rss feeds: Lists curated major German news feeds\n"
             "- !rss list: Lists active subscriptions in this room\n"
             "- !rss defaults: Subscribes this room to all top German news feeds\n"
@@ -569,6 +835,8 @@ class RSSPlugin(Plugin):
             "- !rss unsubscribe <id_or_slug_or_url>: Removes an active subscription\n"
             "- !help: Shows this usage guide",
             "<b>📰 RSS Capability Commands:</b><ul>"
+            "<li><code>!rss queue</code>: Displays delivery queue status, dynamic rate pacing, and next poll ETA.</li>"
+            "<li><code>!rss poll</code>: Triggers an immediate poll of all subscribed feeds.</li>"
             "<li><code>!rss feeds</code>: Lists curated major German news feeds (Tagesschau, Spiegel, FAZ, Zeit, etc.).</li>"
             "<li><code>!rss list</code>: Lists active subscriptions in this room.</li>"
             "<li><code>!rss defaults</code>: Quickly subscribes this room to top German news feeds.</li>"
@@ -580,7 +848,9 @@ class RSSPlugin(Plugin):
 
     def get_help(self) -> str:
         return (
-            "• <b>!rss feeds</b>: Lists curated major German news feeds (Tagesschau, Spiegel, FAZ, Zeit, etc.).<br>"
+            "• <b>!rss queue</b>: Displays delivery queue size, dynamic output rate, and next poll ETA.<br>"
+            "• <b>!rss poll</b>: Triggers an immediate poll of all feeds.<br>"
+            "• <b>!rss feeds</b>: Lists curated major German news feeds.<br>"
             "• <b>!rss defaults</b>: Subscribes this room to top German news feeds.<br>"
             "• <b>!rss list</b>: Lists active subscriptions for this room/context.<br>"
             "• <b>!rss subscribe &lt;url_or_slug&gt; [filters]</b>: Subscribes to an RSS feed URL or slug alias with filtering options.<br>"

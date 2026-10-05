@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     hubspot_access_token: Optional[str] = None
     enable_rss: bool = True
+    rss_poll_interval_seconds: int = 3600  # Default 60 minutes
+    rss_min_delivery_interval_seconds: int = 5  # Prevent flooding Matrix API
+    rss_max_delivery_interval_seconds: int = 3600
+    rss_default_channel: Optional[str] = None  # Explicit default room override (e.g. #sauna:pramari.de)
     enable_stock: bool = False
     enable_hubspot: bool = False
     enable_onboarding: bool = False

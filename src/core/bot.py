@@ -137,6 +137,14 @@ class MatrixBot:
                 pass
             self._ticker_task = None
 
+        # Stop plugins with background workers
+        for plugin in self.plugin_manager.plugins.values():
+            if hasattr(plugin, "stop"):
+                try:
+                    await plugin.stop()
+                except Exception as e:
+                    logger.error("Error stopping plugin", plugin_id=plugin.plugin_id, error=str(e))
+
         if self.client:
             logger.debug("Closing client session...")
             await self.client.close()

@@ -35,7 +35,7 @@ async def main() -> None:
     # 4. Synchronize default RSS fixtures (major German news)
     logger.info("Synchronizing default RSS fixtures...")
     from src.fixtures.rss_feeds import seed_default_rss_feeds
-    await seed_default_rss_feeds()
+    await seed_default_rss_feeds(auto_subscribe_targets=settings.startup_rooms_list)
 
     logger.info("Starting Matrix Bot Service...")
 
@@ -44,7 +44,7 @@ async def main() -> None:
 
     if settings.enable_rss:
         from src.plugins.rss import RSSPlugin
-        rss_plugin = RSSPlugin()
+        rss_plugin = RSSPlugin(settings=settings)
         plugin_manager.register_plugin(rss_plugin)
         logger.info("RSS feed plugin registered.")
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import List, Optional
-from sqlalchemy import String, DateTime, ForeignKey, func, JSON
+from sqlalchemy import String, DateTime, ForeignKey, func, JSON, Text, Integer
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.models.base import Base
 
@@ -20,6 +20,9 @@ class RSSFeed(Base):
     )
     history: Mapped[List["RSSHistory"]] = relationship(
         "RSSHistory", back_populates="feed", cascade="all, delete-orphan"
+    )
+    queue_items: Mapped[List["RSSQueueItem"]] = relationship(
+        "RSSQueueItem", back_populates="feed", cascade="all, delete-orphan"
     )
 
     def __repr__(self) -> str:
@@ -64,3 +67,30 @@ class RSSHistory(Base):
 
     def __repr__(self) -> str:
         return f"<RSSHistory entry_id={self.entry_id} feed={self.feed_id}>"
+
+
+class RSSQueueItem(Base):
+    """Represents an article queued for paced delivery to a subscriber room/user."""
+    __tablename__ = "rss_delivery_queue"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[str] = mapped_column(String(255), nullable=False)  # Matrix Room ID or User ID
+    feed_id: Mapped[int] = mapped_column(ForeignKey("rss_feeds.id", ondelete="CASCADE"), nullable=False)
+    entry_id: Mapped[str] = mapped_column(String(512), nullable=False)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    link: Mapped[str] = mapped_column(String(1024), nullable=False)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    matches: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
+    feed_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="pending", index=True, nullable=False)  # 'pending', 'delivered', 'failed'
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), index=True, nullable=False)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Relationships
+    feed: Mapped["RSSFeed"] = relationship("RSSFeed", back_populates="queue_items")
+
+    def __repr__(self) -> str:
+        return f"<RSSQueueItem id={self.id} subscriber={self.subscriber_id} title={self.title[:30]!r} status={self.status}>"
+
