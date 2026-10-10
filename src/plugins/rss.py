@@ -7,7 +7,14 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any
 from sqlalchemy import select, delete, func
 from sqlalchemy.orm import joinedload
-from nio import AsyncClient, MatrixRoom, RoomMessageText
+from nio import (
+    AsyncClient,
+    MatrixRoom,
+    RoomMessageText,
+    RoomSendResponse,
+    RoomSendError,
+    RoomResolveAliasResponse,
+)
 from src.core.plugin import Plugin
 from src.core.database import get_db_session
 from src.models.rss import RSSFeed, RSSSubscription, RSSHistory, RSSQueueItem
@@ -19,8 +26,31 @@ from src.utils.logger import get_logger
 logger = get_logger(__name__)
 
 async def send_rich_message(client: AsyncClient, room_id: str, plain: str, html: str) -> None:
-    """Helper to send formatted HTML messages to a Matrix room."""
-    await client.room_send(
+    """Helper to send formatted HTML messages to a Matrix room.
+    
+    If room_id is an alias (starts with #), resolves it to a canonical room ID.
+    Raises RuntimeError if delivery fails.
+    """
+    if room_id.startswith("#"):
+        resolved = None
+        if hasattr(client, "rooms"):
+            for rid, r in client.rooms.items():
+                if r.canonical_alias == room_id:
+                    resolved = rid
+                    break
+        if not resolved:
+            try:
+                res_alias = await client.room_resolve_alias(room_id)
+                if isinstance(res_alias, RoomResolveAliasResponse):
+                    resolved = res_alias.room_id
+                else:
+                    logger.error("Failed to resolve room alias in send_rich_message", alias=room_id, error=str(res_alias))
+            except Exception as e:
+                logger.error("Error resolving room alias in send_rich_message", alias=room_id, error=str(e))
+        if resolved:
+            room_id = resolved
+
+    response = await client.room_send(
         room_id=room_id,
         message_type="m.room.message",
         content={
@@ -30,6 +60,14 @@ async def send_rich_message(client: AsyncClient, room_id: str, plain: str, html:
             "formatted_body": html
         }
     )
+    if isinstance(response, RoomSendError):
+        logger.error(
+            "Matrix room_send failed",
+            room_id=room_id,
+            error=response.message,
+            status_code=getattr(response, "status_code", None)
+        )
+        raise RuntimeError(f"Matrix room_send failed ({getattr(response, 'status_code', 'unknown')}): {response.message}")
 
 class RSSPlugin(Plugin):
     """RSS Syndication capability plugin. Ingests feeds into a queue and paces delivery predictably."""
@@ -40,6 +78,7 @@ class RSSPlugin(Plugin):
         self._min_delivery_interval = getattr(self.settings, "rss_min_delivery_interval_seconds", 5)  # Min seconds between alerts
         self._max_delivery_interval = getattr(self.settings, "rss_max_delivery_interval_seconds", 3600)
         self._default_channel = getattr(self.settings, "rss_default_channel", None)
+        self._room_id_cache: Dict[str, str] = {}
 
         self._last_poll_time: float = 0.0
         self._last_delivery_time: float = 0.0
@@ -752,34 +791,68 @@ class RSSPlugin(Plugin):
             return True, matches
         return False, []
 
-    def _resolve_target_room(self, client: AsyncClient, subscriber_id: str) -> Optional[str]:
-        """Resolves a subscriber identifier to a valid Matrix room ID or alias."""
-        # 1. Direct room ID or alias
-        if subscriber_id.startswith("!") or subscriber_id.startswith("#"):
+    async def _resolve_target_room(self, client: AsyncClient, subscriber_id: str) -> Optional[str]:
+        """Resolves a subscriber identifier (alias, room ID, user ID, room name) to a valid Matrix room ID."""
+        if not subscriber_id:
+            return None
+
+        # 1. Direct canonical Matrix room ID
+        if subscriber_id.startswith("!"):
             return subscriber_id
 
-        # 2. Match against client rooms by name or canonical alias
+        # 2. Check cached room IDs
+        if subscriber_id in self._room_id_cache:
+            return self._room_id_cache[subscriber_id]
+
+        # 3. If subscriber is a room alias (#...), resolve it
+        if subscriber_id.startswith("#"):
+            if hasattr(client, "rooms"):
+                for r_id, room in client.rooms.items():
+                    if room.canonical_alias == subscriber_id:
+                        self._room_id_cache[subscriber_id] = r_id
+                        return r_id
+            try:
+                res = await client.room_resolve_alias(subscriber_id)
+                if isinstance(res, RoomResolveAliasResponse):
+                    self._room_id_cache[subscriber_id] = res.room_id
+                    return res.room_id
+                else:
+                    logger.warning("Could not resolve room alias via homeserver", alias=subscriber_id, res=str(res))
+            except Exception as e:
+                logger.error("Exception resolving room alias", alias=subscriber_id, error=str(e))
+
+        # 4. Check client.rooms by name or canonical alias
         if hasattr(client, "rooms"):
             for room_id, room in client.rooms.items():
                 if room.name == subscriber_id or room.canonical_alias == subscriber_id:
+                    self._room_id_cache[subscriber_id] = room_id
                     return room_id
 
-            # 3. Direct user DM
+            # 5. Direct user DM
             if subscriber_id.startswith("@"):
                 for room_id, room in client.rooms.items():
                     if len(room.users) <= 2 and subscriber_id in room.users:
+                        self._room_id_cache[subscriber_id] = room_id
                         return room_id
 
-        # 4. Configured default channel
-        if self._default_channel:
-            return self._default_channel
-
-        # 5. Startup rooms list
+        # 6. Fallbacks: default channel override or startup rooms list
+        fallbacks = []
+        if self._default_channel and self._default_channel != subscriber_id:
+            fallbacks.append(self._default_channel)
         if self.settings.startup_rooms_list:
-            return self.settings.startup_rooms_list[0]
+            for s_room in self.settings.startup_rooms_list:
+                if s_room != subscriber_id and s_room not in fallbacks:
+                    fallbacks.append(s_room)
+        if "#sauna:pramari.de" != subscriber_id and "#sauna:pramari.de" not in fallbacks:
+            fallbacks.append("#sauna:pramari.de")
 
-        # 6. Fallback default
-        return "#sauna:pramari.de"
+        for fallback in fallbacks:
+            resolved = await self._resolve_target_room(client, fallback)
+            if resolved:
+                self._room_id_cache[subscriber_id] = resolved
+                return resolved
+
+        return None
 
     async def _deliver_alert_from_queue(
         self,
@@ -792,10 +865,10 @@ class RSSPlugin(Plugin):
         matches: List[str]
     ) -> None:
         """Sends formatted HTML alert details to the matched subscriber room or user DM."""
-        target_room_id = self._resolve_target_room(client, subscriber_id)
+        target_room_id = await self._resolve_target_room(client, subscriber_id)
         if not target_room_id:
             logger.warning("Could not resolve target room for subscriber", subscriber_id=subscriber_id)
-            return
+            raise RuntimeError(f"Could not resolve target room for subscriber: {subscriber_id}")
 
         summary_clean = ""
         if summary:

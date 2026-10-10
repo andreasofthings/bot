@@ -1,6 +1,15 @@
 import asyncio
 from typing import Optional, List
-from nio import AsyncClient, MatrixRoom, RoomMessageText, InviteEvent, LoginResponse
+from nio import (
+    AsyncClient,
+    MatrixRoom,
+    RoomMessageText,
+    InviteEvent,
+    LoginResponse,
+    RoomSendResponse,
+    RoomSendError,
+    RoomResolveAliasResponse,
+)
 from src.config import Settings
 from src.core.plugin import PluginManager
 from src.utils.logger import get_logger
@@ -10,7 +19,26 @@ logger = get_logger(__name__)
 
 async def send_rich_message(client: AsyncClient, room_id: str, plain: str, html: str) -> None:
     """Helper to send formatted HTML messages to a Matrix room."""
-    await client.room_send(
+    if room_id.startswith("#"):
+        resolved = None
+        if hasattr(client, "rooms"):
+            for rid, r in client.rooms.items():
+                if r.canonical_alias == room_id:
+                    resolved = rid
+                    break
+        if not resolved:
+            try:
+                res_alias = await client.room_resolve_alias(room_id)
+                if isinstance(res_alias, RoomResolveAliasResponse):
+                    resolved = res_alias.room_id
+                else:
+                    logger.error("Failed to resolve room alias in send_rich_message", alias=room_id, error=str(res_alias))
+            except Exception as e:
+                logger.error("Error resolving room alias in send_rich_message", alias=room_id, error=str(e))
+        if resolved:
+            room_id = resolved
+
+    response = await client.room_send(
         room_id=room_id,
         message_type="m.room.message",
         content={
@@ -20,6 +48,14 @@ async def send_rich_message(client: AsyncClient, room_id: str, plain: str, html:
             "formatted_body": html,
         },
     )
+    if isinstance(response, RoomSendError):
+        logger.error(
+            "Matrix room_send failed",
+            room_id=room_id,
+            error=response.message,
+            status_code=getattr(response, "status_code", None),
+        )
+        raise RuntimeError(f"Matrix room_send failed ({getattr(response, 'status_code', 'unknown')}): {response.message}")
 
 
 class MatrixBot:
