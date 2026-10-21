@@ -1,11 +1,12 @@
 import asyncio
 import feedparser
+import html
 import httpx
 import shlex
 import re
 from datetime import datetime
 from typing import List, Optional, Dict, Any
-from sqlalchemy import select, delete, func
+from sqlalchemy import select, delete, update, func
 from sqlalchemy.orm import joinedload
 from nio import (
     AsyncClient,
@@ -78,6 +79,11 @@ class RSSPlugin(Plugin):
         self._min_delivery_interval = getattr(self.settings, "rss_min_delivery_interval_seconds", 5)  # Min seconds between alerts
         self._max_delivery_interval = getattr(self.settings, "rss_max_delivery_interval_seconds", 3600)
         self._default_channel = getattr(self.settings, "rss_default_channel", None)
+        # Summary mode settings (batched LLM digest delivery)
+        self._summary_interval = getattr(self.settings, "rss_summary_interval_seconds", 3600)
+        self._summary_model = getattr(self.settings, "rss_summary_model", "gemini-3.5-flash-lite")
+        self._summary_max_articles = getattr(self.settings, "rss_summary_max_articles", 20)
+        self._summary_max_output_tokens = getattr(self.settings, "rss_summary_max_output_tokens", 1024)
         self._room_id_cache: Dict[str, str] = {}
 
         self._last_poll_time: float = 0.0
@@ -85,6 +91,7 @@ class RSSPlugin(Plugin):
         self._current_interval: float = 60.0
         self._is_running: bool = True
         self._dispatcher_task: Optional[asyncio.Task] = None
+        self._summary_task: Optional[asyncio.Task] = None
         self._new_item_event = asyncio.Event()
         self._poll_lock = asyncio.Lock()
 
@@ -145,6 +152,16 @@ class RSSPlugin(Plugin):
             await self._handle_poll_now(client, room, event)
             return
 
+        # 8. Command: !rss mode <id_or_slug> <timeline|summary>
+        elif sub_cmd == "mode":
+            await self._handle_mode(client, room, event, args[1:])
+            return
+
+        # 9. Command: !rss language <id_or_slug> <auto|de|en|...>
+        elif sub_cmd in ["language", "lang"]:
+            await self._handle_language(client, room, event, args[1:])
+            return
+
         else:
             await self._send_usage(client, room.room_id)
 
@@ -187,8 +204,11 @@ class RSSPlugin(Plugin):
             for sub in subscriptions:
                 feed_name = sub.feed.name or sub.feed.url
                 feed_url = sub.feed.url
-                html_lines.append(f"<li>{sub.feed_id} - <a href='{feed_url}'>{feed_name}</a> (subscribed by <code>{sub.subscriber_id}</code>)</li>")
-                plain_lines.append(f"  {sub.feed_id} - {feed_name} ({feed_url}) (subscribed by {sub.subscriber_id})")
+                mode_str = sub.delivery_mode or "timeline"
+                if mode_str == "summary":
+                    mode_str = f"summary/{sub.summary_language or 'auto'}"
+                html_lines.append(f"<li>{sub.feed_id} - <a href='{feed_url}'>{feed_name}</a> ({mode_str}) (subscribed by <code>{sub.subscriber_id}</code>)</li>")
+                plain_lines.append(f"  {sub.feed_id} - {feed_name} ({feed_url}) [{mode_str}] (subscribed by {sub.subscriber_id})")
             html_lines.append("</ul>")
 
             await send_rich_message(client, room.room_id, "\n".join(plain_lines), "".join(html_lines))
@@ -281,6 +301,8 @@ class RSSPlugin(Plugin):
 
         # Parse flags using argparse-like strategy via standard shlex
         keywords, companies, geos, reps = None, None, None, None
+        delivery_mode = "timeline"
+        summary_language = "auto"
         try:
             # We reconstruct the string and parse with shlex to support quotes in flags
             arg_line = " ".join(sub_args[1:])
@@ -301,11 +323,25 @@ class RSSPlugin(Plugin):
                 elif flag == "--representatives" and i + 1 < len(parsed_args):
                     reps = [r.strip() for r in parsed_args[i+1].split(",") if r.strip()]
                     i += 2
+                elif flag == "--mode" and i + 1 < len(parsed_args):
+                    delivery_mode = parsed_args[i+1].strip().lower()
+                    i += 2
+                elif flag in ("--lang", "--language") and i + 1 < len(parsed_args):
+                    summary_language = parsed_args[i+1].strip().lower()
+                    i += 2
                 else:
                     i += 1
         except Exception as e:
             logger.error("Failed to parse filter flags", error=str(e))
             await send_rich_message(client, room.room_id, "Error parsing filter options.", "❌ <b>Error parsing filter options.</b> Make sure quotes are balanced.")
+            return
+
+        if delivery_mode not in ("timeline", "summary"):
+            await send_rich_message(
+                client, room.room_id,
+                f"Unknown delivery mode '{delivery_mode}'. Use 'timeline' or 'summary'.",
+                f"❌ Unknown delivery mode <code>{html.escape(delivery_mode)}</code>. Use <code>timeline</code> or <code>summary</code>."
+            )
             return
 
         # Fetch subscriber target ID (prefer canonical alias, fallback to room ID)
@@ -368,7 +404,9 @@ class RSSPlugin(Plugin):
                 keywords=keywords,
                 companies=companies,
                 geographies=geos,
-                representatives=reps
+                representatives=reps,
+                delivery_mode=delivery_mode,
+                summary_language=summary_language[:8] if summary_language else "auto"
             )
             session.add(subscription)
             
@@ -378,9 +416,10 @@ class RSSPlugin(Plugin):
                 f"• <b>Keywords:</b> {keywords or 'None'}<br>"
                 f"• <b>Companies:</b> {companies or 'None'}<br>"
                 f"• <b>Geography:</b> {geos or 'None'}<br>"
-                f"• <b>Representatives:</b> {reps or 'None'}"
+                f"• <b>Representatives:</b> {reps or 'None'}<br>"
+                f"• <b>Mode:</b> {delivery_mode}" + (f" (language: {summary_language})" if delivery_mode == "summary" else "")
             )
-            plain_msg = f"Successfully Subscribed!\n- Feed: {feed.name or feed.url}\n- Keywords: {keywords}\n- Companies: {companies}"
+            plain_msg = f"Successfully Subscribed!\n- Feed: {feed.name or feed.url}\n- Keywords: {keywords}\n- Companies: {companies}\n- Mode: {delivery_mode}" + (f" (language: {summary_language})" if delivery_mode == "summary" else "")
             await send_rich_message(client, room.room_id, plain_msg, html_msg)
 
     async def _handle_unsubscribe(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText, unsub_args: List[str]) -> None:
@@ -430,19 +469,145 @@ class RSSPlugin(Plugin):
             await session.delete(subscription)
             await send_rich_message(client, room.room_id, "Successfully unsubscribed.", "Successfully unsubscribed.")
 
+    async def _find_subscription(self, session, subscriber_id: str, target: str) -> Optional[RSSSubscription]:
+        """Resolves a subscription for the current context by feed ID, URL, or fixture slug."""
+        feed_id = None
+        if target.isdigit():
+            feed_id = int(target)
+
+        if feed_id:
+            q = select(RSSSubscription).where(
+                RSSSubscription.subscriber_id == subscriber_id,
+                RSSSubscription.feed_id == feed_id
+            ).options(joinedload(RSSSubscription.feed))
+        else:
+            fixture = find_fixture_by_slug_or_name(target)
+            target_url = fixture["url"] if fixture else target
+            q_feed = select(RSSFeed).where(RSSFeed.url == target_url)
+            res_feed = await session.execute(q_feed)
+            feed_rec = res_feed.scalar_one_or_none()
+            if not feed_rec:
+                return None
+            q = select(RSSSubscription).where(
+                RSSSubscription.subscriber_id == subscriber_id,
+                RSSSubscription.feed_id == feed_rec.id
+            ).options(joinedload(RSSSubscription.feed))
+        res = await session.execute(q)
+        return res.scalar_one_or_none()
+
+    async def _handle_mode(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText, mode_args: List[str]) -> None:
+        """Switches an existing subscription between 'timeline' and 'summary' delivery."""
+        if len(mode_args) < 2:
+            await send_rich_message(
+                client, room.room_id,
+                "Usage: !rss mode <id_or_slug_or_url> <timeline|summary>",
+                "Usage: <code>!rss mode &lt;id_or_slug_or_url&gt; &lt;timeline|summary&gt;</code>"
+            )
+            return
+
+        target = mode_args[0].strip()
+        new_mode = mode_args[1].strip().lower()
+        if new_mode not in ("timeline", "summary"):
+            await send_rich_message(
+                client, room.room_id,
+                f"Unknown delivery mode '{new_mode}'. Use 'timeline' or 'summary'.",
+                f"❌ Unknown delivery mode <code>{html.escape(new_mode)}</code>. Use <code>timeline</code> or <code>summary</code>."
+            )
+            return
+
+        subscriber_id = room.canonical_alias if room.canonical_alias else room.room_id
+        if len(room.users) <= 2:
+            subscriber_id = event.sender
+
+        async with get_db_session() as session:
+            subscription = await self._find_subscription(session, subscriber_id, target)
+            if not subscription:
+                await send_rich_message(client, room.room_id, "No active subscription found.", "No active subscription found.")
+                return
+
+            subscription.delivery_mode = new_mode
+            if new_mode == "summary":
+                # First digest goes out as soon as pending articles exist
+                subscription.last_summary_at = None
+
+            # Re-stamp pending queue items so in-flight articles follow the new mode
+            q_update = (
+                update(RSSQueueItem)
+                .where(
+                    RSSQueueItem.subscriber_id == subscription.subscriber_id,
+                    RSSQueueItem.feed_id == subscription.feed_id,
+                    RSSQueueItem.status == "pending"
+                )
+                .values(delivery_mode=new_mode)
+            )
+            await session.execute(q_update)
+            await session.commit()
+            # Capture display values before the session closes (feed relationship is joined-loaded)
+            feed_name = subscription.feed.name if subscription.feed else subscription.feed_id
+
+            msg = f"Delivery mode for '{feed_name}' set to '{new_mode}'."
+            html_msg = f"✅ Delivery mode for <b>{html.escape(str(feed_name))}</b> set to <code>{new_mode}</code>."
+            if new_mode == "summary":
+                lang = subscription.summary_language or "auto"
+                msg += f" Summaries are delivered every {self._summary_interval // 60} minutes (language: {lang})."
+                html_msg += f" Summaries are delivered every {self._summary_interval // 60} minutes (language: <code>{html.escape(lang)}</code>)."
+            await send_rich_message(client, room.room_id, msg, html_msg)
+
+    async def _handle_language(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText, lang_args: List[str]) -> None:
+        """Sets the summary language for an existing summary-mode subscription."""
+        if len(lang_args) < 2:
+            await send_rich_message(
+                client, room.room_id,
+                "Usage: !rss language <id_or_slug_or_url> <auto|de|en|fr|...>",
+                "Usage: <code>!rss language &lt;id_or_slug_or_url&gt; &lt;auto|de|en|fr|...&gt;</code>"
+            )
+            return
+
+        target = lang_args[0].strip()
+        language = lang_args[1].strip().lower()
+        if not language:
+            await send_rich_message(client, room.room_id, "Language must not be empty.", "❌ Language must not be empty.")
+            return
+
+        subscriber_id = room.canonical_alias if room.canonical_alias else room.room_id
+        if len(room.users) <= 2:
+            subscriber_id = event.sender
+
+        async with get_db_session() as session:
+            subscription = await self._find_subscription(session, subscriber_id, target)
+            if not subscription:
+                await send_rich_message(client, room.room_id, "No active subscription found.", "No active subscription found.")
+                return
+
+            subscription.summary_language = language[:8]
+            await session.commit()
+            feed_name = subscription.feed.name if subscription.feed else subscription.feed_id
+
+            msg = f"Summary language for '{feed_name}' set to '{language}'."
+            html_msg = f"✅ Summary language for <b>{html.escape(str(feed_name))}</b> set to <code>{html.escape(language)}</code>."
+            await send_rich_message(client, room.room_id, msg, html_msg)
+
     async def _handle_queue_status(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
         """Reports the current status of the RSS delivery queue and pacing rate."""
         async with get_db_session() as session:
-            pending_q = select(func.count(RSSQueueItem.id)).where(RSSQueueItem.status == "pending")
+            pending_q = (
+                select(func.count(RSSQueueItem.id))
+                .where(RSSQueueItem.status == "pending", RSSQueueItem.delivery_mode == "timeline")
+            )
+            summary_q = (
+                select(func.count(RSSQueueItem.id))
+                .where(RSSQueueItem.status == "pending", RSSQueueItem.delivery_mode == "summary")
+            )
             delivered_q = select(func.count(RSSQueueItem.id)).where(RSSQueueItem.status == "delivered")
             
             pending_count = (await session.execute(pending_q)).scalar() or 0
+            summary_count = (await session.execute(summary_q)).scalar() or 0
             delivered_count = (await session.execute(delivered_q)).scalar() or 0
             
-            # Fetch next 3 pending articles
+            # Fetch next 3 pending articles (timeline items are paced one-by-one)
             next_items_q = (
                 select(RSSQueueItem)
-                .where(RSSQueueItem.status == "pending")
+                .where(RSSQueueItem.status == "pending", RSSQueueItem.delivery_mode == "timeline")
                 .order_by(RSSQueueItem.created_at.asc(), RSSQueueItem.id.asc())
                 .limit(3)
             )
@@ -462,6 +627,7 @@ class RSSPlugin(Plugin):
         html = [
             "<b>📊 RSS Delivery Queue & Pacing Status</b>",
             f"• <b>Pending Articles in Queue:</b> <code>{pending_count}</code>",
+            f"• <b>Pending Awaiting Summary:</b> <code>{summary_count}</code>",
             f"• <b>Total Delivered:</b> <code>{delivered_count}</code>",
             f"• <b>Current Output Rate:</b> <code>{rate_str}</code>",
             f"• <b>Poll Cycle Interval:</b> <code>{self._poll_interval_seconds // 60} minutes</code>",
@@ -479,6 +645,7 @@ class RSSPlugin(Plugin):
         plain = (
             f"RSS Queue Status:\n"
             f"- Pending in Queue: {pending_count}\n"
+            f"- Pending Awaiting Summary: {summary_count}\n"
             f"- Total Delivered: {delivered_count}\n"
             f"- Output Rate: {rate_str}\n"
             f"- Next Poll in: {mins_until_poll}m {secs_until_poll}s"
@@ -502,13 +669,15 @@ class RSSPlugin(Plugin):
         logger.info("Stopping RSSPlugin background tasks...")
         self._is_running = False
         self._new_item_event.set()
-        if self._dispatcher_task:
-            self._dispatcher_task.cancel()
-            try:
-                await self._dispatcher_task
-            except asyncio.CancelledError:
-                pass
-            self._dispatcher_task = None
+        for task in (self._dispatcher_task, self._summary_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._dispatcher_task = None
+        self._summary_task = None
 
     async def on_tick(self, client: AsyncClient) -> None:
         """Periodic background callback triggered by the bot's scheduler.
@@ -518,7 +687,11 @@ class RSSPlugin(Plugin):
         if self._dispatcher_task is None or self._dispatcher_task.done():
             self._dispatcher_task = asyncio.create_task(self._run_queue_dispatcher(client))
 
-        # 2. Check if polling interval has elapsed
+        # 2. Ensure the summary scheduler worker is active
+        if self._summary_task is None or self._summary_task.done():
+            self._summary_task = asyncio.create_task(self._run_summary_scheduler(client))
+
+        # 3. Check if polling interval has elapsed
         now_ts = datetime.now().timestamp()
         if self._last_poll_time == 0.0 or (now_ts - self._last_poll_time >= self._poll_interval_seconds):
             await self.poll_all_feeds(client)
@@ -611,6 +784,7 @@ class RSSPlugin(Plugin):
                                             summary=summary,
                                             matches=reasons,
                                             feed_name=feed.name or feed.url,
+                                            delivery_mode=sub.delivery_mode or "timeline",
                                             status="pending"
                                         )
                                         session.add(queue_item)
@@ -640,9 +814,13 @@ class RSSPlugin(Plugin):
 
         while self._is_running:
             try:
-                # 1. Check pending items count
+                # 1. Check pending items count (timeline items only; summary batches are handled
+                # by the dedicated summary scheduler)
                 async with get_db_session() as session:
-                    count_q = select(func.count(RSSQueueItem.id)).where(RSSQueueItem.status == "pending")
+                    count_q = select(func.count(RSSQueueItem.id)).where(
+                        RSSQueueItem.status == "pending",
+                        RSSQueueItem.delivery_mode == "timeline"
+                    )
                     count_res = await session.execute(count_q)
                     pending_count = count_res.scalar() or 0
 
@@ -668,12 +846,12 @@ class RSSPlugin(Plugin):
                 interval = max(self._min_delivery_interval, min(ideal_interval, self._max_delivery_interval))
                 self._current_interval = interval
 
-                # 3. Fetch the oldest pending article to deliver
+                # 3. Fetch the oldest pending article to deliver (timeline items only)
                 item_to_deliver = None
                 async with get_db_session() as session:
                     item_q = (
                         select(RSSQueueItem)
-                        .where(RSSQueueItem.status == "pending")
+                        .where(RSSQueueItem.status == "pending", RSSQueueItem.delivery_mode == "timeline")
                         .order_by(RSSQueueItem.created_at.asc(), RSSQueueItem.id.asc())
                         .limit(1)
                     )
@@ -744,6 +922,255 @@ class RSSPlugin(Plugin):
                 logger.exception("Unexpected error in RSS queue dispatcher", error=str(e))
                 await asyncio.sleep(10.0)
 
+    async def _run_summary_scheduler(self, client: AsyncClient) -> None:
+        """Background worker that periodically batches pending articles per summary subscription
+        and delivers one LLM-generated digest message per (subscriber, feed).
+
+        Runs independently of the timeline pacing loop. Skips silently when a subscription has
+        no pending articles ('skip if no update happened').
+        """
+        logger.info("Starting RSS summary scheduler worker...", interval_seconds=self._summary_interval)
+
+        while self._is_running:
+            try:
+                await self._process_summary_subscriptions(client)
+            except asyncio.CancelledError:
+                logger.info("RSS summary scheduler loop cancelled.")
+                break
+            except Exception as e:
+                logger.exception("Unexpected error in RSS summary scheduler", error=str(e))
+                await asyncio.sleep(10.0)
+
+            await asyncio.sleep(30.0)
+
+    async def _process_summary_subscriptions(self, client: AsyncClient) -> None:
+        """Checks every summary-mode subscription and delivers due digests."""
+        now = datetime.now()
+
+        async with get_db_session() as session:
+            subs_q = (
+                select(RSSSubscription)
+                .where(RSSSubscription.delivery_mode == "summary")
+                .options(joinedload(RSSSubscription.feed))
+            )
+            subscriptions = (await session.execute(subs_q)).scalars().unique().all()
+
+        for sub in subscriptions:
+            if not self._is_running:
+                break
+
+            # 1. Respect the configured summary interval (per subscription)
+            if sub.last_summary_at is not None:
+                elapsed = (now - sub.last_summary_at).total_seconds()
+                if elapsed < self._summary_interval:
+                    continue
+
+            # 2. Gather the pending batch for this (subscriber, feed), oldest first
+            async with get_db_session() as session:
+                items_q = (
+                    select(RSSQueueItem)
+                    .where(
+                        RSSQueueItem.subscriber_id == sub.subscriber_id,
+                        RSSQueueItem.feed_id == sub.feed_id,
+                        RSSQueueItem.status == "pending",
+                        RSSQueueItem.delivery_mode == "summary"
+                    )
+                    .order_by(RSSQueueItem.created_at.asc(), RSSQueueItem.id.asc())
+                    .limit(self._summary_max_articles)
+                )
+                items = (await session.execute(items_q)).scalars().all()
+
+            # 3. Skip if no update happened since the last summary
+            if not items:
+                continue
+
+            await self._deliver_summary_batch(
+                client,
+                subscription_id=sub.id,
+                feed=sub.feed,
+                subscriber_id=sub.subscriber_id,
+                language=sub.summary_language or "auto",
+                items=items
+            )
+
+    async def _deliver_summary_batch(
+        self,
+        client: AsyncClient,
+        subscription_id: int,
+        feed: RSSFeed,
+        subscriber_id: str,
+        language: str,
+        items: List[RSSQueueItem]
+    ) -> None:
+        """Generates (or falls back to) a digest for the given batch and delivers it as one message."""
+        target_room_id = await self._resolve_target_room(client, subscriber_id)
+        if not target_room_id:
+            logger.warning("Could not resolve target room for summary subscriber", subscriber_id=subscriber_id)
+            return
+
+        feed_name = feed.name or feed.url
+        articles = [
+            {
+                "title": item.title,
+                "link": item.link,
+                "summary": item.summary or ""
+            }
+            for item in items
+        ]
+
+        # 1. Attempt the LLM summary (None on failure or missing API key)
+        summary_text = await self._generate_feed_summary(feed_name, language, articles)
+
+        now = datetime.now()
+        item_ids = [item.id for item in items]
+
+        if summary_text is None:
+            # 2. Failure path: count the attempt; after 3 failed attempts deliver unsummarized
+            async with get_db_session() as session:
+                await session.execute(
+                    update(RSSQueueItem)
+                    .where(RSSQueueItem.id.in_(item_ids))
+                    .values(attempts=RSSQueueItem.attempts + 1)
+                )
+                await session.commit()
+                refresh_q = select(RSSQueueItem.attempts).where(RSSQueueItem.id.in_(item_ids))
+                attempts = [row[0] for row in (await session.execute(refresh_q)).all()]
+
+            if attempts and min(attempts) < 3:
+                logger.warning(
+                    "RSS summary generation failed; will retry",
+                    feed=feed_name,
+                    subscriber=subscriber_id,
+                    batch_size=len(items)
+                )
+                return
+
+            logger.warning(
+                "RSS summary generation failed repeatedly; delivering unsummarized digest",
+                feed=feed_name,
+                subscriber=subscriber_id
+            )
+
+        # 3. Compose and send the digest message
+        summary_html = ""
+        summary_plain = ""
+        if summary_text:
+            summary_html = f"<p>{html.escape(summary_text).replace(chr(10), '<br>')}</p>"
+            summary_plain = f"\n{summary_text}\n"
+
+        headline_html = "".join(
+            f"<li><a href='{a['link']}'>{html.escape(a['title'])}</a></li>" for a in articles
+        )
+        headline_plain = "".join(
+            f"{idx}. {a['title']}\n   {a['link']}\n" for idx, a in enumerate(articles, 1)
+        )
+
+        html_body = (
+            f"📰 <b>{html.escape(str(feed_name))}</b> — <b>Summary</b> ({len(articles)} articles)"
+            f"{summary_html}"
+            f"<b>Headlines:</b><ul>{headline_html}</ul>"
+        )
+        plain_body = (
+            f"📰 {feed_name} — Summary ({len(articles)} articles)"
+            f"{summary_plain}"
+            f"Headlines:\n{headline_plain}"
+        )
+
+        try:
+            await send_rich_message(client, target_room_id, plain_body, html_body)
+        except Exception as e:
+            logger.error("Failed to deliver RSS summary digest", target=target_room_id, error=str(e))
+            raise
+
+        # 4. Mark the batch delivered and anchor the next summary interval
+        async with get_db_session() as session:
+            await session.execute(
+                update(RSSQueueItem)
+                .where(RSSQueueItem.id.in_(item_ids))
+                .values(status="delivered", delivered_at=now)
+            )
+            db_sub = await session.get(RSSSubscription, subscription_id)
+            if db_sub:
+                db_sub.last_summary_at = now
+            await session.commit()
+
+        logger.info(
+            "Delivered RSS summary digest",
+            feed=feed_name,
+            subscriber=subscriber_id,
+            articles=len(articles),
+            summarized=summary_text is not None
+        )
+
+    async def _generate_feed_summary(self, feed_name: str, language: str, articles: List[Dict[str, Any]]) -> Optional[str]:
+        """Calls the Gemini API to summarize a batch of articles from one feed.
+
+        Returns the summary text, or None on failure (missing API key, HTTP error, empty response).
+        """
+        api_key = getattr(self.settings, "gemini_api_key", None)
+        if not api_key:
+            logger.warning("GEMINI_API_KEY not configured; RSS summaries unavailable", feed=feed_name)
+            return None
+
+        article_lines = []
+        for idx, article in enumerate(articles, 1):
+            teaser = re.sub(r"<[^>]+>", "", article.get("summary") or "").strip()
+            if len(teaser) > 300:
+                teaser = teaser[:297] + "..."
+            article_lines.append(
+                f"{idx}. {article.get('title', 'No Title')}\n   Link: {article.get('link', '')}\n   Teaser: {teaser or '(none)'}"
+            )
+        prompt = "\n".join(article_lines)
+
+        if language == "auto":
+            language_directive = "Write the summary in the same language as the source articles."
+        else:
+            language_directive = f"Write the summary in {language}."
+
+        system_instruction = (
+            "You are a news digest writer for a Matrix chat bot.\n"
+            f"Below are {len(articles)} recent headlines with teaser texts from the RSS feed '{feed_name}'.\n"
+            "Write a concise summary of the events they describe: 2-4 short paragraphs, factual and neutral. "
+            "Group related stories and highlight the most important developments. "
+            "Do not invent facts that are not supported by the headlines and teasers. "
+            "Do not append a headline list; the bot adds one itself. "
+            "Output plain text only, no markdown formatting."
+            f" {language_directive}"
+        )
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self._summary_model}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }],
+            "systemInstruction": {
+                "parts": [{"text": system_instruction}]
+            },
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": self._summary_max_output_tokens
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as http_client:
+                resp = await http_client.post(url, json=payload)
+                if resp.status_code != 200:
+                    logger.error("Gemini summary API error", status=resp.status_code, body=resp.text[:500], model=self._summary_model)
+                    return None
+
+                result = resp.json()
+                candidates = result.get("candidates") or []
+                if not candidates:
+                    logger.warning("Gemini summary returned no candidates", feed=feed_name)
+                    return None
+                parts = candidates[0].get("content", {}).get("parts") or []
+                text = "".join(part.get("text", "") for part in parts).strip()
+                return text or None
+        except Exception as e:
+            logger.error("Failed to call Gemini summary API", feed=feed_name, error=str(e))
+            return None
+
     def _evaluate_relevance(self, entry: Any, sub: RSSSubscription) -> tuple[bool, List[str]]:
         """Evaluates whether a feed entry matches a subscription's filters."""
         # Clean text compilation (title + summary/description)
@@ -754,7 +1181,7 @@ class RSSPlugin(Plugin):
         # If no filters are defined, it's a catch-all subscription
         has_filters = any([sub.keywords, sub.companies, sub.geographies, sub.representatives])
         if not has_filters:
-            return True, ["All content (no filters defined)"]
+            return True, [""] # was: ["All content (no filters defined)"]
 
         matches = []
 
@@ -886,7 +1313,9 @@ class RSSPlugin(Plugin):
         if summary_clean:
             html_body += f"<br><br><blockquote>{summary_clean}</blockquote>"
 
-        plain_body = f"📰 {feed_name or 'News Feed'}: {title}\n{link}\nMatches: {reasons_str}"
+        plain_body = f"📰 {feed_name or 'News Feed'}: {title}\n{link}"
+        if reasons_str:
+            plain_body += f"\nMatches: {reasons_str}"
 
         try:
             await send_rich_message(client, target_room_id, plain_body, html_body)
@@ -904,8 +1333,10 @@ class RSSPlugin(Plugin):
             "- !rss feeds: Lists curated major German news feeds\n"
             "- !rss list: Lists active subscriptions in this room\n"
             "- !rss defaults: Subscribes this room to all top German news feeds\n"
-            "- !rss subscribe <url_or_slug> [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]\n"
+            "- !rss subscribe <url_or_slug> [--mode timeline|summary] [--lang <code>] [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]\n"
             "- !rss unsubscribe <id_or_slug_or_url>: Removes an active subscription\n"
+            "- !rss mode <id_or_slug_or_url> <timeline|summary>: Switches delivery mode (summary = batched AI digest)\n"
+            "- !rss language <id_or_slug_or_url> <auto|de|en|...>: Sets the summary language\n"
             "- !help: Shows this usage guide",
             "<b>📰 RSS Capability Commands:</b><ul>"
             "<li><code>!rss queue</code>: Displays delivery queue status, dynamic rate pacing, and next poll ETA.</li>"
@@ -913,8 +1344,10 @@ class RSSPlugin(Plugin):
             "<li><code>!rss feeds</code>: Lists curated major German news feeds (Tagesschau, Spiegel, FAZ, Zeit, etc.).</li>"
             "<li><code>!rss list</code>: Lists active subscriptions in this room.</li>"
             "<li><code>!rss defaults</code>: Quickly subscribes this room to top German news feeds.</li>"
-            "<li><code>!rss subscribe &lt;url_or_slug&gt; [filters]</code>: Subscribes with optional filters (e.g. <code>!rss subscribe tagesschau</code> or <code>!rss subscribe heise --keywords KI,Security</code>).</li>"
+            "<li><code>!rss subscribe &lt;url_or_slug&gt; [filters]</code>: Subscribes with optional filters and delivery mode (e.g. <code>!rss subscribe tagesschau</code> or <code>!rss subscribe heise --mode summary --lang de</code>).</li>"
             "<li><code>!rss unsubscribe &lt;id_or_slug_or_url&gt;</code>: Removes an active subscription.</li>"
+            "<li><code>!rss mode &lt;id_or_slug_or_url&gt; &lt;timeline|summary&gt;</code>: timeline delivers each article paced; summary delivers one AI-generated digest per interval (default hourly).</li>"
+            "<li><code>!rss language &lt;id_or_slug_or_url&gt; &lt;auto|de|en|...&gt;</code>: Sets the language of AI summaries (auto mirrors the source articles).</li>"
             "<li><code>!help</code>: Displays this help message.</li>"
             "</ul>"
         )
@@ -926,6 +1359,8 @@ class RSSPlugin(Plugin):
             "• <b>!rss feeds</b>: Lists curated major German news feeds.<br>"
             "• <b>!rss defaults</b>: Subscribes this room to top German news feeds.<br>"
             "• <b>!rss list</b>: Lists active subscriptions for this room/context.<br>"
-            "• <b>!rss subscribe &lt;url_or_slug&gt; [filters]</b>: Subscribes to an RSS feed URL or slug alias with filtering options.<br>"
-            "• <b>!rss unsubscribe &lt;id_or_slug_or_url&gt;</b>: Unsubscribes from a feed."
+            "• <b>!rss subscribe &lt;url_or_slug&gt; [filters]</code>: Subscribes to an RSS feed URL or slug alias with filtering options (supports <code>--mode summary</code>).<br>"
+            "• <b>!rss unsubscribe &lt;id_or_slug_or_url&gt;</b>: Unsubscribes from a feed.<br>"
+            "• <b>!rss mode &lt;id_or_slug_or_url&gt; &lt;timeline|summary&gt;</b>: Switches between paced single articles and AI summary digests.<br>"
+            "• <b>!rss language &lt;id_or_slug_or_url&gt; &lt;auto|de|en|...&gt;</b>: Sets the language of AI summaries."
         )

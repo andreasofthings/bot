@@ -297,6 +297,8 @@ class MatrixBot:
                 "- !rss defaults: Subscribes room to top German news feeds.",
                 "- !rss subscribe <url_or_slug> [--keywords k1] [--companies c1] [--geo g1] [--representatives r1]: Subscribes room/user to feed URL or slug alias with optional relevance filters.",
                 "- !rss unsubscribe <id_or_slug_or_url>: Cancels RSS feed subscription.",
+                "- !rss mode <id_or_slug_or_url> <timeline|summary>: Switches delivery mode; summary delivers one AI-generated digest per interval.",
+                "- !rss language <id_or_slug_or_url> <auto|de|en|...>: Sets the language of AI summaries.",
             ])
         if "stock" in active_plugins:
             cmd_lines.extend([

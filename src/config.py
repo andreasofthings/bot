@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     rss_min_delivery_interval_seconds: int = 5  # Prevent flooding Matrix API
     rss_max_delivery_interval_seconds: int = 3600
     rss_default_channel: Optional[str] = None  # Explicit default room override (e.g. #sauna:pramari.de)
+    # Summary mode: batched LLM digest delivery (cheapest Gemini model; free tier eligible)
+    rss_summary_interval_seconds: int = 3600  # How often summary subscriptions deliver (min gap between digests)
+    rss_summary_model: str = "gemini-3.5-flash-lite"
+    rss_summary_max_articles: int = 20  # Cap on articles merged into one summary prompt
+    rss_summary_max_output_tokens: int = 1024
     enable_stock: bool = False
     enable_hubspot: bool = False
     enable_onboarding: bool = False

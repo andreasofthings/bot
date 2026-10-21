@@ -43,7 +43,14 @@ class RSSSubscription(Base):
     companies: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
     geographies: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
     representatives: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
-    
+
+    # Delivery behavior: 'timeline' (one article at a time, paced) or 'summary' (batched LLM digest)
+    delivery_mode: Mapped[str] = mapped_column(String(20), default="timeline", server_default="timeline", nullable=False)
+    # Language directive for Gemini summaries: 'auto' mirrors the source articles, else a fixed language
+    summary_language: Mapped[str] = mapped_column(String(8), default="auto", server_default="auto", nullable=False)
+    # Timestamp of the last delivered summary; anchors the summary cadence (None = never delivered)
+    last_summary_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
 
     # Relationships
@@ -82,6 +89,8 @@ class RSSQueueItem(Base):
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     matches: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
     feed_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Snapshot of the subscription's delivery mode at enqueue time ('timeline' or 'summary')
+    delivery_mode: Mapped[str] = mapped_column(String(20), default="timeline", server_default="timeline", nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="pending", index=True, nullable=False)  # 'pending', 'delivered', 'failed'
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), index=True, nullable=False)
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
