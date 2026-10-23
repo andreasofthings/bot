@@ -200,57 +200,14 @@ class MatrixBot:
             )
 
     async def _on_room_message(self, room: MatrixRoom, event: RoomMessageText) -> None:
-        """Parses message body for commands and dispatches them to plugins or handles onboarding."""
+        """Parses message body for commands and dispatches them to plugins."""
         # Ignore messages sent by the bot itself
         if event.sender == self.client.user_id:
             return
 
         body = event.body.strip()
-        
-        # Check user onboarding status only if onboarding plugin is active
-        if "onboarding" in self.plugin_manager.plugins:
-            from src.core.database import get_db_session
-            from src.models.user import User
 
-            async with get_db_session() as session:
-                user = await session.get(User, event.sender)
-
-                # Identify platform source (Signal, WhatsApp, Matrix)
-                platform = "Matrix"
-                if "signal_" in event.sender:
-                    platform = "Signal"
-                elif "whatsapp_" in event.sender:
-                    platform = "WhatsApp"
-
-                is_completed = user is not None and user.onboarding_state == "COMPLETED"
-
-                if not is_completed:
-                    # Check if it's a command that bypasses onboarding
-                    is_bypass = False
-                    if body.startswith("!"):
-                        parts = body[1:].split()
-                        if parts:
-                            cmd = parts[0].lower()
-                            if cmd in ["help", "status", "activate"]:
-                                is_bypass = True
-
-                    if not is_bypass:
-                        # Determine if this is a private context (DM)
-                        is_dm = len(room.users) <= 2
-                        
-                        if is_dm:
-                            from src.plugins.onboarding import handle_onboarding_message
-                            await handle_onboarding_message(self.client, room, event, user, platform)
-                            return
-                        else:
-                            # In a public channel, warn the user if they tried to run a command
-                            if body.startswith("!"):
-                                html_msg = f"Hello <a href='https://matrix.to/#/{event.sender}'>{event.sender}</a>! Please start a private chat (DM) with me to complete onboarding before using commands."
-                                plain_msg = f"Hello {event.sender}! Please start a private chat (DM) with me to complete onboarding before using commands."
-                                await send_rich_message(self.client, room.room_id, plain_msg, html_msg)
-                            return
-
-        # If onboarding is completed or not active, parse command
+        # Parse command
         if not body.startswith("!"):
             if self.settings.gemini_api_key:
                 interpreted_command = await self._route_natural_language(room, event, body)
@@ -299,26 +256,6 @@ class MatrixBot:
                 "- !rss unsubscribe <id_or_slug_or_url>: Cancels RSS feed subscription.",
                 "- !rss mode <id_or_slug_or_url> <timeline|summary>: Switches delivery mode; summary delivers one AI-generated digest per interval.",
                 "- !rss language <id_or_slug_or_url> <auto|de|en|...>: Sets the language of AI summaries.",
-            ])
-        if "stock" in active_plugins:
-            cmd_lines.extend([
-                "- !stock list: Lists active indicator threshold alerts.",
-                "- !stock check <ticker> [indicator] [period]: Inspects a stock or its technical indicators on-demand.",
-                "- !stock subscribe <ticker> <indicator> <period> <condition> <threshold>: Subscribes to stock indicator alerts.",
-                "- !stock unsubscribe <id_or_ticker>: Cancels active stock alerts.",
-            ])
-        if "hubspot" in active_plugins:
-            cmd_lines.extend([
-                "- !hubspot status: Checks HubSpot CRM connection and account diagnostics.",
-                "- !hubspot auth <token>: Connects a HubSpot Private App access token.",
-                "- !hubspot test: Pings the HubSpot API.",
-                "- !hubspot disconnect: Deactivates HubSpot CRM connection.",
-            ])
-        if "onboarding" in active_plugins:
-            cmd_lines.extend([
-                "- !status: Shows current service status.",
-                "- !activate <code>: Upgrades user licensing tier.",
-                "- !forgetme: Wipes database user profile.",
             ])
 
         cmds_str = "\n".join(cmd_lines)

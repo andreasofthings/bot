@@ -48,26 +48,6 @@ async def main() -> None:
         plugin_manager.register_plugin(rss_plugin)
         logger.info("RSS feed plugin registered.")
 
-    if settings.enable_help:
-        from src.plugins.help import HelpPlugin
-        plugin_manager.register_plugin(HelpPlugin(plugin_manager))
-        logger.info("Help plugin registered.")
-
-    if settings.enable_onboarding:
-        from src.plugins.onboarding import OnboardingPlugin
-        plugin_manager.register_plugin(OnboardingPlugin())
-        logger.info("Onboarding plugin registered.")
-
-    if settings.enable_stock:
-        from src.plugins.stock import StockPlugin
-        plugin_manager.register_plugin(StockPlugin())
-        logger.info("Stock plugin registered.")
-
-    if settings.enable_hubspot:
-        from src.plugins.hubspot import HubSpotPlugin
-        plugin_manager.register_plugin(HubSpotPlugin())
-        logger.info("HubSpot plugin registered.")
-
     logger.info("Registered active plugins", plugins=list(plugin_manager.plugins.keys()))
 
     # 3. Instantiate bot runner

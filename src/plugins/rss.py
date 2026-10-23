@@ -19,7 +19,6 @@ from nio import (
 from src.core.plugin import Plugin
 from src.core.database import get_db_session
 from src.models.rss import RSSFeed, RSSSubscription, RSSHistory, RSSQueueItem
-from src.models.user import User
 from src.config import load_settings
 from src.fixtures.rss_feeds import get_default_rss_fixtures, find_fixture_by_slug_or_name
 from src.utils.logger import get_logger
@@ -285,9 +284,8 @@ class RSSPlugin(Plugin):
 
     async def _handle_subscribe(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText, sub_args: List[str]) -> None:
         """Subscribes the current room context to an RSS feed URL, parsing filter arguments."""
-        settings = load_settings()
         if not sub_args:
-            await send_rich_message(client, room.room_id, "Usage: !rss subscribe <url> [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]", "Usage: <code>!rss subscribe &lt;url&gt; [--keywords ...]</code>")
+            await send_rich_message(client, room.room_id, "Usage: !rss subscribe <url> [--mode timeline|summary] [--lang <code>] [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]", "Usage: <code>!rss subscribe &lt;url&gt; [--keywords ...]</code>")
             return
 
         feed_input = sub_args[0].strip()
@@ -351,23 +349,7 @@ class RSSPlugin(Plugin):
             subscriber_id = event.sender
             
         async with get_db_session() as session:
-            # 1. Ensure user has not exceeded Free Tier limit
-            if len(room.users) <= 2 or not room.canonical_alias:
-                # Query user tier
-                user_rec = await session.get(User, event.sender)
-                if user_rec and user_rec.tier == "FREE":
-                    # Check existing active subscriptions for this user
-                    q_sub_count = select(RSSSubscription).where(RSSSubscription.subscriber_id == event.sender)
-                    res_count = await session.execute(q_sub_count)
-                    if len(res_count.scalars().all()) >= settings.free_tier_limit:
-                        await send_rich_message(
-                            client, room.room_id,
-                            f"Free Tier Limit Exceeded. You can only have {settings.free_tier_limit} active subscriptions. Upgrade to Premium.",
-                            f"❌ <b>Limit Exceeded:</b> Free Tier is restricted to {settings.free_tier_limit} active subscriptions. Activate Premium using <code>!activate &lt;code&gt;</code>."
-                        )
-                        return
-
-            # 2. Get or create RSS Feed
+            # 1. Get or create RSS Feed
             q_feed = select(RSSFeed).where(RSSFeed.url == feed_url)
             res_feed = await session.execute(q_feed)
             feed = res_feed.scalar_one_or_none()

@@ -18,9 +18,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///data/bot.db"
 
     # 3. Third-party APIs & Plugins
-    stock_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
-    hubspot_access_token: Optional[str] = None
     enable_rss: bool = True
     rss_poll_interval_seconds: int = 3600  # Default 60 minutes
     rss_min_delivery_interval_seconds: int = 5  # Prevent flooding Matrix API
@@ -31,18 +29,8 @@ class Settings(BaseSettings):
     rss_summary_model: str = "gemini-3.5-flash-lite"
     rss_summary_max_articles: int = 20  # Cap on articles merged into one summary prompt
     rss_summary_max_output_tokens: int = 1024
-    enable_stock: bool = False
-    enable_hubspot: bool = False
-    enable_onboarding: bool = False
-    enable_help: bool = False
 
-    # 4. Admin & Productization
-    admin_room_id: Optional[str] = None
-    admin_users: str = ""  # Comma-separated in env
-    free_tier_limit: int = 2
-    webhook_secret: Optional[str] = None
-
-    # 5. Operations & Logging
+    # 4. Operations & Logging
     log_level: str = "INFO"
     json_logging: bool = False
     health_port: int = 8080
@@ -81,13 +69,6 @@ class Settings(BaseSettings):
             url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
         return url
-
-    @property
-    def admin_users_list(self) -> List[str]:
-        """Returns the admin user IDs as a parsed list."""
-        if not self.admin_users:
-            return []
-        return [user_id.strip() for user_id in self.admin_users.split(",") if user_id.strip()]
 
     @property
     def startup_rooms_list(self) -> List[str]:

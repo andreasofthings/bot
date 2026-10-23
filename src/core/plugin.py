@@ -12,7 +12,7 @@ class Plugin(abc.ABC):
     @property
     @abc.abstractmethod
     def plugin_id(self) -> str:
-        """Unique identifier for the plugin (e.g., 'rss', 'stock')."""
+        """Unique identifier for the plugin (e.g., 'rss')."""
         pass
 
     @property
