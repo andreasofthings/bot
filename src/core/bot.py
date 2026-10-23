@@ -256,6 +256,7 @@ class MatrixBot:
                 "- !rss unsubscribe <id_or_slug_or_url>: Cancels RSS feed subscription.",
                 "- !rss mode <id_or_slug_or_url> <timeline|summary>: Switches delivery mode; summary delivers one AI-generated digest per interval.",
                 "- !rss language <id_or_slug_or_url> <auto|de|en|...>: Sets the language of AI summaries.",
+                "- !rss opml export: Exports the current subscriptions as an OPML file.",
             ])
 
         cmds_str = "\n".join(cmd_lines)

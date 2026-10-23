@@ -2,8 +2,12 @@ import asyncio
 import feedparser
 import html
 import httpx
+import io
 import shlex
 import re
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import format_datetime
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from sqlalchemy import select, delete, update, func
@@ -15,6 +19,8 @@ from nio import (
     RoomSendResponse,
     RoomSendError,
     RoomResolveAliasResponse,
+    UploadResponse,
+    UploadError,
 )
 from src.core.plugin import Plugin
 from src.core.database import get_db_session
@@ -161,18 +167,27 @@ class RSSPlugin(Plugin):
             await self._handle_language(client, room, event, args[1:])
             return
 
+        # 10. Command: !rss opml [export]
+        elif sub_cmd == "opml":
+            await self._handle_opml(client, room, event, args[1:])
+            return
+
         else:
             await self._send_usage(client, room.room_id)
 
-    async def _handle_list(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
-        """Lists active subscriptions for the current context (checks room ID, room name, and canonical alias)."""
-        # Collect identifiers that might represent this subscriber
+    def _context_identifiers(self, room: MatrixRoom, event: RoomMessageText) -> List[str]:
+        """Collects identifiers that might represent the current subscriber context.
+
+        Mirrors the resolution used by subscription commands: room ID, room name,
+        canonical alias, the sender's ID in DM contexts, and the 'Product' alias
+        for the main sauna room.
+        """
         identifiers = [room.room_id]
         if room.name:
             identifiers.append(room.name)
         if room.canonical_alias:
             identifiers.append(room.canonical_alias)
-            
+
         # If in a DM context, also check the sender's ID
         if len(room.users) <= 2:
             identifiers.append(event.sender)
@@ -180,6 +195,12 @@ class RSSPlugin(Plugin):
         # Fallback: if we are in the main sauna room, also include "Product" subscriptions
         if "#sauna:pramari.de" in identifiers or "!tRiKSCYsVYKBQduVwT:pramari.de" in identifiers:
             identifiers.append("Product")
+
+        return identifiers
+
+    async def _handle_list(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
+        """Lists active subscriptions for the current context (checks room ID, room name, and canonical alias)."""
+        identifiers = self._context_identifiers(room, event)
 
         async with get_db_session() as session:
             q = (
@@ -568,6 +589,101 @@ class RSSPlugin(Plugin):
             msg = f"Summary language for '{feed_name}' set to '{language}'."
             html_msg = f"✅ Summary language for <b>{html.escape(str(feed_name))}</b> set to <code>{html.escape(language)}</code>."
             await send_rich_message(client, room.room_id, msg, html_msg)
+
+    async def _handle_opml(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText, opml_args: List[str]) -> None:
+        """Exports the current context's RSS subscriptions as an OPML file attachment."""
+        action = opml_args[0].strip().lower() if opml_args else "export"
+        if action != "export":
+            await send_rich_message(
+                client, room.room_id,
+                "Usage: !rss opml [export]",
+                "Usage: <code>!rss opml [export]</code> &mdash; exports this context's subscriptions as an OPML file."
+            )
+            return
+
+        identifiers = self._context_identifiers(room, event)
+
+        async with get_db_session() as session:
+            q = (
+                select(RSSSubscription)
+                .where(RSSSubscription.subscriber_id.in_(identifiers))
+                .options(joinedload(RSSSubscription.feed))
+            )
+            subscriptions = (await session.execute(q)).scalars().all()
+
+        if not subscriptions:
+            await send_rich_message(
+                client, room.room_id,
+                "No RSS subscriptions to export for this context.",
+                "No RSS subscriptions to export for this context."
+            )
+            return
+
+        data = self._build_opml_document(subscriptions)
+        filename = f"rss-subscriptions-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.opml"
+
+        # Preferred path: upload the OPML file and attach it to the room
+        try:
+            response, _ = await client.upload(
+                io.BytesIO(data),
+                content_type="application/xml",
+                filename=filename
+            )
+            if not isinstance(response, UploadResponse):
+                raise RuntimeError(f"OPML upload failed: {response.message}")
+
+            content = {
+                "msgtype": "m.file",
+                "body": filename,
+                "info": {
+                    "mimetype": "application/xml",
+                    "size": len(data),
+                },
+                "url": response.content_uri,
+            }
+            send_result = await client.room_send(
+                room_id=room.room_id,
+                message_type="m.room.message",
+                content=content
+            )
+            if isinstance(send_result, RoomSendError):
+                raise RuntimeError(f"OPML file message failed: {send_result.message}")
+
+            logger.info(
+                "Exported RSS subscriptions as OPML",
+                subscriber_count=len(subscriptions),
+                room_id=room.room_id,
+                filename=filename
+            )
+            return
+        except Exception as e:
+            logger.error("OPML file delivery failed; falling back to inline export", room_id=room.room_id, error=str(e))
+
+        # Fallback: send the OPML document inline as text
+        opml_text = data.decode("utf-8")
+        await send_rich_message(
+            client, room.room_id,
+            f"RSS subscriptions OPML export ({len(subscriptions)} feeds):\n\n{opml_text}",
+            f"RSS subscriptions OPML export ({len(subscriptions)} feeds):<br><br><pre><code>{html.escape(opml_text)}</code></pre>"
+        )
+
+    @staticmethod
+    def _build_opml_document(subscriptions: List[RSSSubscription]) -> bytes:
+        """Builds an OPML 2.0 document listing the given subscriptions' feeds."""
+        opml = ET.Element("opml", {"version": "2.0"})
+        head = ET.SubElement(opml, "head")
+        ET.SubElement(head, "title").text = "Matrix RSS bot subscriptions"
+        ET.SubElement(head, "dateCreated").text = format_datetime(datetime.now(timezone.utc))
+        body = ET.SubElement(opml, "body")
+        for sub in subscriptions:
+            feed = sub.feed
+            ET.SubElement(body, "outline", {
+                "type": "rss",
+                "text": feed.name or feed.url,
+                "xmlUrl": feed.url,
+            })
+        ET.indent(opml, space="  ")
+        return ET.tostring(opml, encoding="UTF-8", xml_declaration=True)
 
     async def _handle_queue_status(self, client: AsyncClient, room: MatrixRoom, event: RoomMessageText) -> None:
         """Reports the current status of the RSS delivery queue and pacing rate."""
@@ -1317,6 +1433,7 @@ class RSSPlugin(Plugin):
             "- !rss defaults: Subscribes this room to all top German news feeds\n"
             "- !rss subscribe <url_or_slug> [--mode timeline|summary] [--lang <code>] [--keywords ...] [--companies ...] [--geo ...] [--representatives ...]\n"
             "- !rss unsubscribe <id_or_slug_or_url>: Removes an active subscription\n"
+            "- !rss opml [export]: Exports this context's subscriptions as an OPML file\n"
             "- !rss mode <id_or_slug_or_url> <timeline|summary>: Switches delivery mode (summary = batched AI digest)\n"
             "- !rss language <id_or_slug_or_url> <auto|de|en|...>: Sets the summary language\n"
             "- !help: Shows this usage guide",
@@ -1328,6 +1445,7 @@ class RSSPlugin(Plugin):
             "<li><code>!rss defaults</code>: Quickly subscribes this room to top German news feeds.</li>"
             "<li><code>!rss subscribe &lt;url_or_slug&gt; [filters]</code>: Subscribes with optional filters and delivery mode (e.g. <code>!rss subscribe tagesschau</code> or <code>!rss subscribe heise --mode summary --lang de</code>).</li>"
             "<li><code>!rss unsubscribe &lt;id_or_slug_or_url&gt;</code>: Removes an active subscription.</li>"
+            "<li><code>!rss opml [export]</code>: Downloads this context's subscriptions as an OPML file for other feed readers.</li>"
             "<li><code>!rss mode &lt;id_or_slug_or_url&gt; &lt;timeline|summary&gt;</code>: timeline delivers each article paced; summary delivers one AI-generated digest per interval (default hourly).</li>"
             "<li><code>!rss language &lt;id_or_slug_or_url&gt; &lt;auto|de|en|...&gt;</code>: Sets the language of AI summaries (auto mirrors the source articles).</li>"
             "<li><code>!help</code>: Displays this help message.</li>"
@@ -1343,6 +1461,7 @@ class RSSPlugin(Plugin):
             "• <b>!rss list</b>: Lists active subscriptions for this room/context.<br>"
             "• <b>!rss subscribe &lt;url_or_slug&gt; [filters]</code>: Subscribes to an RSS feed URL or slug alias with filtering options (supports <code>--mode summary</code>).<br>"
             "• <b>!rss unsubscribe &lt;id_or_slug_or_url&gt;</b>: Unsubscribes from a feed.<br>"
+            "• <b>!rss opml [export]</b>: Exports this context's subscriptions as an OPML file.<br>"
             "• <b>!rss mode &lt;id_or_slug_or_url&gt; &lt;timeline|summary&gt;</b>: Switches between paced single articles and AI summary digests.<br>"
             "• <b>!rss language &lt;id_or_slug_or_url&gt; &lt;auto|de|en|...&gt;</b>: Sets the language of AI summaries."
         )
